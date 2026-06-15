@@ -51,6 +51,7 @@ SMB_SHARE_PATH = "//{}/{}".format(FLAREVM_HOST, SMB_SHARE_NAME)
 SMB_LOCAL_PATH = os.environ.get("FLAREVM_SMB_LOCAL_PATH", "C:\\Share")
 
 IDA_MCP_PORT = 13337
+WINDBG_MCP_PORT = int(os.environ.get("WINDBG_MCP_PORT", "13338"))
 
 TOOL_PATHS = {
     "die": "C:\\Tools\\die\\diec.exe",
@@ -60,11 +61,11 @@ TOOL_PATHS = {
     "procmon": "C:\\Tools\\sysinternals\\Procmon.exe",
     "autorunsc": "C:\\Tools\\sysinternals\\autorunsc.exe",
     "strings": "C:\\Tools\\sysinternals\\strings.exe",
-    "pe_sieve": "C:\\Tools\\pe-sieve\\pe-sieve64.exe",
-    "hollows_hunter": "C:\\Tools\\hollows_hunter\\hollows_hunter64.exe",
+    "pe_sieve": "C:\\ProgramData\\chocolatey\\bin\\pe-sieve.exe",
+    "hollows_hunter": "C:\\Tools\\hollows_hunter\\hollows_hunter.exe",
     "upx": "C:\\Tools\\upx\\upx.exe",
     "dnspy": "C:\\Tools\\dnSpy\\dnSpy.Console.exe",
-    "fakenet": "C:\\Tools\\fakenet\\fakenet.exe",
+    "fakenet": "C:\\Tools\\fakenet\\fakenet3.5\\fakenet.exe",
     "nircmd": "C:\\Tools\\nircmd.exe",
     "x64dbg": "C:\\ProgramData\\chocolatey\\bin\\x64dbg.exe",
     "tshark": "C:\\ProgramData\\chocolatey\\bin\\tshark.exe",
@@ -73,7 +74,84 @@ TOOL_PATHS = {
 LOG = logging.getLogger("flarevm-mcp")
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
-executor = ThreadPoolExecutor(max_workers=4)
+executor = ThreadPoolExecutor(max_workers=8)
+
+# ---------------------------------------------------------------------------
+# Per-tool wall-clock timeout table (seconds)
+#
+# Two-layer timeout strategy:
+#   Layer 1 — run_ps_async: enforced per PowerShell call via asyncio.wait_for.
+#             On expiry the WinRM session is reset so the next call gets a
+#             fresh connection.  The background thread continues until the
+#             HTTP connection closes naturally (Python threads cannot be killed).
+#   Layer 2 — call_tool: outer asyncio.wait_for(_dispatch()) catches any
+#             handler that chains multiple run_ps_async calls and collectively
+#             exceeds the per-tool limit, or hangs in non-WinRM code.
+# ---------------------------------------------------------------------------
+TOOL_TIMEOUTS = {
+    # System / file transfer
+    "check_connection":           30,
+    "list_processes":             30,
+    "take_screenshot":            60,
+    "read_file":                  60,
+    "get_file_hash":              60,
+    "execute_powershell":        180,
+    "upload_file":               180,
+    "download_file":             180,
+    # Static analysis
+    "die_analyze":                60,
+    "strings_extract":            60,
+    "entropy_analysis":           60,
+    "yara_scan":                 120,
+    "upx_unpack":                 60,
+    "unpack_detect_and_try":      90,
+    "dnspy_decompile":           120,
+    "floss_extract_strings":     600,   # FLOSS on large binaries is slow
+    "capa_analyze":              600,   # CAPA can take several minutes
+    # Dynamic — process / registry
+    "procmon_start":              60,
+    "procmon_stop":              180,   # CSV export polls up to 90s
+    "procmon_export_csv":        120,
+    "process_hacker_info":        60,
+    "regshot_snapshot":          300,
+    "persistence_audit":         120,
+    "autoruns_analyze":          120,
+    "execute_with_monitoring":   300,
+    # Dynamic — network
+    "monitor_network_realtime":  180,
+    "fakenet_start":             120,
+    "fakenet_stop":               60,
+    "wireshark_capture":         120,
+    # Debuggers
+    "x64dbg_load":                60,
+    "x64dbg_run_script":         120,
+    "windbg_analyze_dump":       300,
+    "windbg_run_cmd":            120,
+    "windbg_list_dumps":          30,
+    "windbg_launch":              60,
+    # Frida
+    "frida_list_processes":       30,
+    "frida_spawn_and_attach":    120,
+    "frida_attach_pid":          120,
+    "frida_run_script":          120,
+    # Injection detection
+    "pe_sieve_scan":              60,
+    "hollows_hunter_scan":        90,
+    "injection_scan_all":        180,
+    # IDA Pro
+    "ida_launch_and_wait":       180,
+    "ida_get_metadata":           30,
+    "ida_list_functions":         30,
+    "ida_decompile_function":     60,
+    "ida_disassemble_function":   60,
+    "ida_list_strings":           30,
+    "ida_set_comment":            30,
+    "ida_rename_function":        30,
+    # Composite playbooks
+    "triage_full":               900,
+    "behavioral_full":          1800,
+}
+DEFAULT_TOOL_TIMEOUT = 300
 
 # ---------------------------------------------------------------------------
 # WinRM session management
@@ -85,9 +163,16 @@ _session = None
 def _get_password():
     global FLAREVM_PASSWORD
     if FLAREVM_PASSWORD is None:
-        FLAREVM_PASSWORD = keyring.get_password("flarevm", FLAREVM_USER)
+        # Prefer explicit environment configuration, then try keyring, then fall back.
+        FLAREVM_PASSWORD = os.environ.get("FLAREVM_PASSWORD")
         if not FLAREVM_PASSWORD:
-            FLAREVM_PASSWORD = os.environ.get("FLAREVM_PASSWORD", "infected")
+            try:
+                FLAREVM_PASSWORD = keyring.get_password("flarevm", FLAREVM_USER)
+            except Exception as e:
+                LOG.warning("Keyring unavailable, falling back to env/default password: %s", e)
+                FLAREVM_PASSWORD = None
+        if not FLAREVM_PASSWORD:
+            FLAREVM_PASSWORD = "infected"
     return FLAREVM_PASSWORD
 
 
@@ -102,6 +187,17 @@ def get_session():
     return _session
 
 
+def _reset_session():
+    """Discard the cached WinRM session so the next call creates a fresh one.
+
+    Called on timeout: the old HTTP connection may be stuck; a new session
+    avoids reusing a socket that will never complete.
+    """
+    global _session
+    _session = None
+    LOG.warning("WinRM session reset (triggered by timeout or error)")
+
+
 def run_ps(command, timeout=120):
     """Run PowerShell command via WinRM synchronously. Returns (stdout, stderr, status_code)."""
     sess = get_session()
@@ -112,19 +208,45 @@ def run_ps(command, timeout=120):
 
 
 async def run_ps_async(command, timeout=120):
-    """Run PowerShell via WinRM asynchronously using ThreadPoolExecutor."""
+    """Run PowerShell via WinRM asynchronously. Returns (stdout, stderr, code).
+
+    Enforces `timeout` at the asyncio level using asyncio.shield so that the
+    coroutine returns promptly on expiry without waiting for the thread to finish
+    (Python threads cannot be cancelled; the thread continues until the WinRM
+    HTTP connection closes naturally).  On timeout the WinRM session is reset so
+    the next call gets a fresh TCP connection.
+    """
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(executor, lambda: run_ps(command, timeout))
+    fut = asyncio.shield(loop.run_in_executor(executor, lambda: run_ps(command, timeout)))
+    try:
+        return await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        _reset_session()
+        return (
+            "",
+            "TIMEOUT: PowerShell command did not respond within {}s — WinRM session reset".format(timeout),
+            1,
+        )
 
 
-async def run_ps_script(script, timeout=300, script_name="mcp_script.ps1"):
+async def run_ps_script(script, timeout=300, script_name="mcp_script.ps1", force_stage=False):
     """Run a long PowerShell script that exceeds the WinRM 8KB command-line limit.
 
     Strategy: stage the script as a local temp file, ship it via SMB (already
     proven working), then invoke `powershell -File`. Falls back to inline
     execution if the script is short enough.
+
+    The inline fallback uses pywinrm's `run_ps`, which base64-encodes the script
+    as UTF-16 and passes it on the WinRM command line. That doubles+expands the
+    payload, so the effective ceiling for the *raw* script is well under 4000
+    chars before Windows rejects it with "The command line is too long". Keep
+    the threshold conservative so anything substantial is staged as a file.
+
+    force_stage: always use SMB staging even for short scripts. Required for
+    scripts that use Invoke-WebRequest (WinRM inline mode can swallow stdout
+    from web response objects; SMB-staged `powershell -File` captures it correctly).
     """
-    if len(script) < 4000:
+    if not force_stage and len(script) < 1500:
         return await run_ps_async(script, timeout=timeout)
 
     remote_path = "C:\\temp\\" + script_name
@@ -171,22 +293,142 @@ async def run_ps_script(script, timeout=300, script_name="mcp_script.ps1"):
 # IDA RPC helper
 # ---------------------------------------------------------------------------
 
-async def ida_rpc_call(method, params=None):
-    """JSON-RPC call to IDA MCP on FlareVM port 13337 via WinRM PowerShell."""
-    payload = {"jsonrpc": "2.0", "method": method, "id": 1}
-    if params:
-        payload["params"] = params
-    payload_json = json.dumps(payload).replace('"', '\\"')
+async def ida_rpc_call(tool_name, arguments=None):
+    """Invoke an IDA MCP tool over the Model Context Protocol on FlareVM.
+
+    The IDA plugin (ida-pro-mcp) is a full MCP server listening on
+    http://127.0.0.1:13337/mcp. Individual tools are invoked with the
+    ``tools/call`` JSON-RPC method, NOT as direct methods, and results come
+    back wrapped as ``result.content[0].text`` (itself a JSON string).
+
+    Returns the parsed tool result (dict/list/str). Raises RuntimeError on a
+    transport error or a tool-level error.
+    """
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": arguments or {}},
+        "id": 1,
+    }
+    # Embed the JSON body in a SINGLE-quoted PowerShell string. PowerShell's
+    # escape character is the backtick, not the backslash, so a double-quoted
+    # form would mangle every '"' in the JSON. Single quotes are literal; the
+    # only character needing escaping is a single quote, doubled.
+    ps_body = json.dumps(payload).replace("'", "''")
     ps = (
-        '$body = "{}"\n'
-        "$resp = Invoke-WebRequest -Uri 'http://127.0.0.1:{}/jsonrpc' "
+        "$body = '{}'\n"
+        "$resp = Invoke-WebRequest -Uri 'http://127.0.0.1:{}/mcp' "
         "-Method POST -ContentType 'application/json' -Body $body -UseBasicParsing\n"
-        "$resp.Content"
-    ).format(payload_json, IDA_MCP_PORT)
-    stdout, stderr, code = await run_ps_async(ps, timeout=60)
+        "Write-Output $resp.Content"
+    ).format(ps_body, IDA_MCP_PORT)
+    stdout, stderr, code = await run_ps_script(ps, timeout=60, script_name="ida_rpc.ps1", force_stage=True)
     if code != 0:
-        raise RuntimeError("IDA RPC error: {} {}".format(stderr, stdout))
-    return json.loads(stdout)
+        raise RuntimeError("IDA RPC transport error: {} {}".format(stderr, stdout))
+    try:
+        envelope = json.loads(stdout)
+    except json.JSONDecodeError:
+        raise RuntimeError("IDA RPC: non-JSON response: {}".format(stdout[:500]))
+    if isinstance(envelope, dict) and envelope.get("error"):
+        err = envelope["error"]
+        msg = err.get("message", err) if isinstance(err, dict) else err
+        raise RuntimeError("IDA tool '{}' error: {}".format(tool_name, msg))
+    result = envelope.get("result", {}) if isinstance(envelope, dict) else {}
+    content = result.get("content") if isinstance(result, dict) else None
+    if content and isinstance(content, list):
+        text = content[0].get("text", "")
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return text
+    return result
+
+
+async def windbg_rpc_call(tool_name, arguments=None, timeout=120):
+    """Invoke an mcp-windbg tool via its HTTP server on FlareVM (port WINDBG_MCP_PORT).
+
+    mcp-windbg uses the MCP 2025-03-26 streamable HTTP transport with json_response=True.
+    The protocol requires an initialize handshake before tool calls are accepted.
+    Session state (open cdb.exe processes keyed by dump path) persists in the server
+    process across HTTP sessions, so a new HTTP session for each call is safe.
+    """
+    init_payload = json.dumps({
+        "jsonrpc": "2.0",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "flarevm-mcp", "version": "1.0"},
+        },
+        "id": 1,
+    }).replace("'", "''")
+    notif_body = '{"jsonrpc":"2.0","method":"notifications/initialized"}'.replace("'", "''")
+    tool_payload = json.dumps({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": arguments or {}},
+        "id": 2,
+    }).replace("'", "''")
+
+    ps = (
+        "$url = 'http://127.0.0.1:{port}/mcp'\n"
+        "# mcp-windbg requires Accept: application/json (rejects SSE-only clients)\n"
+        "$ct  = @{{ 'Content-Type' = 'application/json'; 'Accept' = 'application/json' }}\n"
+        "\n"
+        "# 1. Initialize MCP session\n"
+        "$initBody = '{init}'\n"
+        "$initResp = Invoke-WebRequest -Uri $url -Method POST -Headers $ct "
+        "-Body $initBody -UseBasicParsing -ErrorAction Stop\n"
+        "$sid = $initResp.Headers['Mcp-Session-Id']\n"
+        "\n"
+        "# 2. notifications/initialized\n"
+        "$notifBody = '{notif}'\n"
+        "$hdr = @{{ 'Content-Type' = 'application/json'; 'Accept' = 'application/json'; 'Mcp-Session-Id' = $sid }}\n"
+        "Invoke-WebRequest -Uri $url -Method POST -Headers $hdr -Body $notifBody "
+        "-UseBasicParsing -ErrorAction SilentlyContinue | Out-Null\n"
+        "\n"
+        "# 3. tools/call\n"
+        "$toolBody = '{tool}'\n"
+        "$toolResp = Invoke-WebRequest -Uri $url -Method POST -Headers $hdr "
+        "-Body $toolBody -UseBasicParsing -ErrorAction Stop\n"
+        "Write-Output $toolResp.Content\n"
+    ).format(port=WINDBG_MCP_PORT, init=init_payload, notif=notif_body, tool=tool_payload)
+
+    stdout, stderr, code = await run_ps_script(ps, timeout=timeout, script_name="windbg_rpc.ps1", force_stage=True)
+    LOG.debug("windbg_rpc_call %s: code=%s stdout=%r stderr=%r", tool_name, code, stdout[:200], stderr[:200])
+    if code != 0:
+        raise RuntimeError("mcp-windbg transport error (is MCP_WinDbg_Server running?): {} {}".format(
+            stderr, stdout
+        ))
+    if not stdout.strip():
+        raise RuntimeError("mcp-windbg: empty stdout (code={}); stderr: {}".format(code, stderr[:300]))
+    try:
+        envelope = json.loads(stdout)
+    except json.JSONDecodeError:
+        raise RuntimeError("mcp-windbg: non-JSON response: {}".format(stdout[:500]))
+    if isinstance(envelope, dict) and envelope.get("error"):
+        err = envelope["error"]
+        msg = err.get("message", err) if isinstance(err, dict) else str(err)
+        raise RuntimeError("mcp-windbg '{}' error: {}".format(tool_name, msg))
+    result = envelope.get("result", {}) if isinstance(envelope, dict) else {}
+    content = result.get("content") if isinstance(result, dict) else None
+    if content and isinstance(content, list):
+        text = content[0].get("text", "")
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return text
+    return result
+
+
+async def _ida_resolve_address(target):
+    """Accept a function name or a 0x-address; return a usable address string."""
+    s = str(target).strip()
+    if s.lower().startswith("0x"):
+        return s
+    info = await ida_rpc_call("get_function_by_name", {"name": s})
+    if isinstance(info, dict) and info.get("address"):
+        return info["address"]
+    raise RuntimeError("Could not resolve function '{}' to an address".format(target))
 
 
 # ---------------------------------------------------------------------------
@@ -261,9 +503,11 @@ def generate_fakenet_config(kali_ip=None, excluded_ports=None, excluded_processe
     blacklist_procs = ",".join(excluded_processes)
     return """[FakeNet]
 DivertTraffic: Yes
-NetworkMode: SingleHost
 
 [Diverter]
+# NetworkMode belongs to [Diverter] in FakeNet-NG 3.x; placing it under
+# [FakeNet] makes the diverter abort with "You must configure a NetworkMode".
+NetworkMode: SingleHost
 # PRIMARY SHIELD: never intercept traffic to/from analyst host
 HostBlackList: {kali_ip}
 # Process exclusions (WinRM/SMB host processes)
@@ -306,7 +550,7 @@ Port: 80
 Protocol: TCP
 Listener: HTTPListener
 UseSSL: No
-Webroot: C:\\Tools\\fakenet\\defaultFiles\\
+Webroot: C:\\Tools\\fakenet\\fakenet3.5\\defaultFiles\\
 DumpHTTPPosts: Yes
 DumpHTTPPostsFilePrefix: http
 
@@ -316,7 +560,7 @@ Port: 443
 Protocol: TCP
 Listener: HTTPListener
 UseSSL: Yes
-Webroot: C:\\Tools\\fakenet\\defaultFiles\\
+Webroot: C:\\Tools\\fakenet\\fakenet3.5\\defaultFiles\\
 DumpHTTPPosts: Yes
 DumpHTTPPostsFilePrefix: https
 
@@ -678,14 +922,54 @@ async def list_tools():
         ),
         Tool(
             name="windbg_analyze_dump",
-            description="Analyze a crash/memory dump with WinDbg (cdb.exe command-line).",
+            description=(
+                "Open a crash/memory dump via mcp-windbg (cdb.exe) on FlareVM and run initial "
+                "triage. Returns crash info, call stack, loaded modules and threads. "
+                "Requires mcp-windbg HTTP server running on port 13338 (registered as "
+                "MCP_WinDbg_Server scheduled task by setup.py)."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "dump_file": {"type": "string", "description": "Path to dump file on FlareVM"},
-                    "commands": {"type": "string", "description": "WinDbg commands to run (default: !analyze -v)", "default": "!analyze -v"},
+                    "dump_file": {"type": "string", "description": "Absolute path to dump file on FlareVM (e.g. C:\\\\temp\\\\crash.dmp)"},
+                    "include_stack_trace": {"type": "boolean", "description": "Include call stack in output", "default": True},
+                    "include_modules": {"type": "boolean", "description": "Include loaded modules in output", "default": True},
+                    "include_threads": {"type": "boolean", "description": "Include thread list in output", "default": True},
+                    "symbols_path": {"type": "string", "description": "Optional symbol server/path (e.g. srv*C:\\symbols*https://msdl.microsoft.com/download/symbols)"},
+                    "extra_commands": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Additional cdb commands to run after initial analysis (e.g. [\"k 40\", \"!peb\"])",
+                    },
                 },
                 "required": ["dump_file"],
+            },
+        ),
+        Tool(
+            name="windbg_run_cmd",
+            description=(
+                "Run an arbitrary cdb command on an already-opened dump session in mcp-windbg. "
+                "Call windbg_analyze_dump first to open the session; subsequent windbg_run_cmd "
+                "calls on the same dump_file reuse the persistent cdb.exe process."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "dump_file": {"type": "string", "description": "Path to the dump file (must match a previously opened session)"},
+                    "command": {"type": "string", "description": "cdb/WinDbg command to execute (e.g. '!ept', 'k 40', 'lm', '!teb')"},
+                },
+                "required": ["dump_file", "command"],
+            },
+        ),
+        Tool(
+            name="windbg_list_dumps",
+            description="List .dmp crash dump files on FlareVM via mcp-windbg.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "directory_path": {"type": "string", "description": "Directory to search for dump files (default: C:\\\\temp and common dump locations)"},
+                },
+                "required": [],
             },
         ),
         # --- Dynamic Analysis: Frida ---
@@ -812,12 +1096,12 @@ async def list_tools():
         ),
         Tool(
             name="windbg_launch",
-            description="Launch WinDbg GUI with a dump file in interactive session.",
+            description="Launch WinDbg GUI with a dump file in the interactive console session.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "dump_file": {"type": "string", "description": "Path to dump file"},
-                    "windbg_path": {"type": "string", "description": "Path to WinDbg", "default": "C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x64\\windbg.exe"},
+                    "windbg_path": {"type": "string", "description": "Path to WinDbg GUI", "default": "C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x64\\windbg.exe"},
                 },
                 "required": ["dump_file"],
             },
@@ -941,6 +1225,49 @@ async def list_tools():
                 "required": [],
             },
         ),
+        Tool(
+            name="execute_with_monitoring",
+            description=(
+                "Execute a binary under full monitoring: starts Procmon capture, launches the "
+                "executable, waits for the specified duration, then stops Procmon and returns "
+                "a combined activity summary (file/reg/net events, new processes)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "executable": {"type": "string",
+                                   "description": "Full path to the executable on FlareVM, e.g. C:\\temp\\sample.exe"},
+                    "arguments":  {"type": "string", "default": "",
+                                   "description": "Command-line arguments to pass to the executable"},
+                    "duration":   {"type": "integer", "default": 30,
+                                   "description": "How many seconds to let the process run before stopping capture"},
+                },
+                "required": ["executable"],
+            },
+        ),
+        Tool(
+            name="autoruns_analyze",
+            description=(
+                "Run Autoruns (autorunsc.exe) to enumerate all autostart entries: registry run "
+                "keys, startup folders, scheduled tasks, services, browser extensions, drivers, "
+                "etc.  Returns a structured list with entry name, publisher, image path, and "
+                "optionally signature status."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "verify_signatures": {
+                        "type": "boolean", "default": True,
+                        "description": "Check digital signatures for each entry (slower but more thorough)"},
+                    "category": {
+                        "type": "string", "default": "*",
+                        "description": "Autorun category filter passed to autorunsc -a: "
+                                       "* (all), l (logon), s (services), t (scheduled tasks), "
+                                       "d (drivers), b (boot execute), c (codecs), etc."},
+                },
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -948,123 +1275,152 @@ async def list_tools():
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict):
+    """MCP tool dispatcher with two-layer hang detection.
+
+    Layer 1 (run_ps_async): each individual WinRM call has its own asyncio
+    timeout so a single stuck PowerShell command does not block forever.
+
+    Layer 2 (here): per-tool wall-clock limit from TOOL_TIMEOUTS catches
+    handlers that chain many calls or hang in non-WinRM code paths.
+    """
+    wall_timeout = TOOL_TIMEOUTS.get(name, DEFAULT_TOOL_TIMEOUT)
     try:
-        # --- System & File Transfer ---
-        if name == "check_connection":
-            return await _handle_check_connection(arguments)
-        elif name == "execute_powershell":
-            return await _handle_execute_powershell(arguments)
-        elif name == "read_file":
-            return await _handle_read_file(arguments)
-        elif name == "upload_file":
-            return await _handle_upload_file(arguments)
-        elif name == "download_file":
-            return await _handle_download_file(arguments)
-        elif name == "get_file_hash":
-            return await _handle_get_file_hash(arguments)
-        elif name == "list_processes":
-            return await _handle_list_processes(arguments)
-        elif name == "take_screenshot":
-            return await _handle_take_screenshot(arguments)
-        # --- Static Analysis ---
-        elif name == "die_analyze":
-            return await _handle_die_analyze(arguments)
-        elif name == "floss_extract_strings":
-            return await _handle_floss_extract_strings(arguments)
-        elif name == "capa_analyze":
-            return await _handle_capa_analyze(arguments)
-        elif name == "yara_scan":
-            return await _handle_yara_scan(arguments)
-        elif name == "strings_extract":
-            return await _handle_strings_extract(arguments)
-        elif name == "entropy_analysis":
-            return await _handle_entropy_analysis(arguments)
-        # --- Dynamic Analysis: Process Monitoring ---
-        elif name == "procmon_start":
-            return await _handle_procmon_start(arguments)
-        elif name == "procmon_stop":
-            return await _handle_procmon_stop(arguments)
-        elif name == "procmon_export_csv":
-            return await _handle_procmon_export_csv(arguments)
-        elif name == "process_hacker_info":
-            return await _handle_process_hacker_info(arguments)
-        # --- Dynamic Analysis: Network ---
-        elif name == "monitor_network_realtime":
-            return await _handle_monitor_network_realtime(arguments)
-        elif name == "fakenet_start":
-            return await _handle_fakenet_start(arguments)
-        elif name == "fakenet_stop":
-            return await _handle_fakenet_stop(arguments)
-        elif name == "wireshark_capture":
-            return await _handle_wireshark_capture(arguments)
-        # --- Dynamic Analysis: Registry ---
-        elif name == "regshot_snapshot":
-            return await _handle_regshot_snapshot(arguments)
-        # --- Dynamic Analysis: Debuggers ---
-        elif name == "x64dbg_load":
-            return await _handle_x64dbg_load(arguments)
-        elif name == "x64dbg_run_script":
-            return await _handle_x64dbg_run_script(arguments)
-        elif name == "windbg_analyze_dump":
-            return await _handle_windbg_analyze_dump(arguments)
-        # --- Dynamic Analysis: Frida ---
-        elif name == "frida_list_processes":
-            return await _handle_frida_list_processes(arguments)
-        elif name == "frida_spawn_and_attach":
-            return await _handle_frida_spawn_and_attach(arguments)
-        elif name == "frida_attach_pid":
-            return await _handle_frida_attach_pid(arguments)
-        elif name == "frida_run_script":
-            return await _handle_frida_run_script(arguments)
-        # --- Injection & Unpacking ---
-        elif name == "pe_sieve_scan":
-            return await _handle_pe_sieve_scan(arguments)
-        elif name == "hollows_hunter_scan":
-            return await _handle_hollows_hunter_scan(arguments)
-        elif name == "upx_unpack":
-            return await _handle_upx_unpack(arguments)
-        elif name == "unpack_detect_and_try":
-            return await _handle_unpack_detect_and_try(arguments)
-        # --- .NET Analysis ---
-        elif name == "dnspy_decompile":
-            return await _handle_dnspy_decompile(arguments)
-        # --- GUI Tool Launchers ---
-        elif name == "ida_launch_and_wait":
-            return await _handle_ida_launch_and_wait(arguments)
-        elif name == "windbg_launch":
-            return await _handle_windbg_launch(arguments)
-        # --- IDA Pro Proxy ---
-        elif name == "ida_get_metadata":
-            return await _handle_ida_get_metadata(arguments)
-        elif name == "ida_list_functions":
-            return await _handle_ida_list_functions(arguments)
-        elif name == "ida_decompile_function":
-            return await _handle_ida_decompile_function(arguments)
-        elif name == "ida_disassemble_function":
-            return await _handle_ida_disassemble_function(arguments)
-        elif name == "ida_list_strings":
-            return await _handle_ida_list_strings(arguments)
-        elif name == "ida_set_comment":
-            return await _handle_ida_set_comment(arguments)
-        elif name == "ida_rename_function":
-            return await _handle_ida_rename_function(arguments)
-        # --- Composite Playbooks ---
-        elif name == "triage_full":
-            return await _handle_triage_full(arguments)
-        elif name == "behavioral_full":
-            return await _handle_behavioral_full(arguments)
-        elif name == "persistence_audit":
-            return await _handle_persistence_audit(arguments)
-        elif name == "injection_scan_all":
-            return await _handle_injection_scan_all(arguments)
-        else:
-            return _text("Unknown tool: {}".format(name))
+        return await asyncio.wait_for(_dispatch(name, arguments), timeout=wall_timeout)
+    except asyncio.TimeoutError:
+        _reset_session()
+        return _text(
+            "[TIMEOUT] Tool '{}' did not complete within {}s. "
+            "The FlareVM may be busy or WinRM unresponsive. "
+            "Call check_connection to verify connectivity.".format(name, wall_timeout)
+        )
     except Exception as e:
         tb = traceback.format_exc()
         LOG.error("Tool %s failed: %s", name, tb)
         return _text("ERROR in tool '{}' with args {}:\n{}\n\n{}".format(
             name, json.dumps(arguments, default=str), str(e), tb
         ))
+
+
+async def _dispatch(name: str, arguments: dict):
+    """Route a tool name to its handler. Called inside the call_tool timeout guard."""
+    # --- System & File Transfer ---
+    if name == "check_connection":
+        return await _handle_check_connection(arguments)
+    elif name == "execute_powershell":
+        return await _handle_execute_powershell(arguments)
+    elif name == "read_file":
+        return await _handle_read_file(arguments)
+    elif name == "upload_file":
+        return await _handle_upload_file(arguments)
+    elif name == "download_file":
+        return await _handle_download_file(arguments)
+    elif name == "get_file_hash":
+        return await _handle_get_file_hash(arguments)
+    elif name == "list_processes":
+        return await _handle_list_processes(arguments)
+    elif name == "take_screenshot":
+        return await _handle_take_screenshot(arguments)
+    # --- Static Analysis ---
+    elif name == "die_analyze":
+        return await _handle_die_analyze(arguments)
+    elif name == "floss_extract_strings":
+        return await _handle_floss_extract_strings(arguments)
+    elif name == "capa_analyze":
+        return await _handle_capa_analyze(arguments)
+    elif name == "yara_scan":
+        return await _handle_yara_scan(arguments)
+    elif name == "strings_extract":
+        return await _handle_strings_extract(arguments)
+    elif name == "entropy_analysis":
+        return await _handle_entropy_analysis(arguments)
+    # --- Dynamic Analysis: Process Monitoring ---
+    elif name == "procmon_start":
+        return await _handle_procmon_start(arguments)
+    elif name == "procmon_stop":
+        return await _handle_procmon_stop(arguments)
+    elif name == "procmon_export_csv":
+        return await _handle_procmon_export_csv(arguments)
+    elif name == "process_hacker_info":
+        return await _handle_process_hacker_info(arguments)
+    # --- Dynamic Analysis: Network ---
+    elif name == "monitor_network_realtime":
+        return await _handle_monitor_network_realtime(arguments)
+    elif name == "fakenet_start":
+        return await _handle_fakenet_start(arguments)
+    elif name == "fakenet_stop":
+        return await _handle_fakenet_stop(arguments)
+    elif name == "wireshark_capture":
+        return await _handle_wireshark_capture(arguments)
+    # --- Dynamic Analysis: Registry ---
+    elif name == "regshot_snapshot":
+        return await _handle_regshot_snapshot(arguments)
+    # --- Dynamic Analysis: Debuggers ---
+    elif name == "x64dbg_load":
+        return await _handle_x64dbg_load(arguments)
+    elif name == "x64dbg_run_script":
+        return await _handle_x64dbg_run_script(arguments)
+    elif name == "windbg_analyze_dump":
+        return await _handle_windbg_analyze_dump(arguments)
+    elif name == "windbg_run_cmd":
+        return await _handle_windbg_run_cmd(arguments)
+    elif name == "windbg_list_dumps":
+        return await _handle_windbg_list_dumps(arguments)
+    # --- Dynamic Analysis: Frida ---
+    elif name == "frida_list_processes":
+        return await _handle_frida_list_processes(arguments)
+    elif name == "frida_spawn_and_attach":
+        return await _handle_frida_spawn_and_attach(arguments)
+    elif name == "frida_attach_pid":
+        return await _handle_frida_attach_pid(arguments)
+    elif name == "frida_run_script":
+        return await _handle_frida_run_script(arguments)
+    # --- Injection & Unpacking ---
+    elif name == "pe_sieve_scan":
+        return await _handle_pe_sieve_scan(arguments)
+    elif name == "hollows_hunter_scan":
+        return await _handle_hollows_hunter_scan(arguments)
+    elif name == "upx_unpack":
+        return await _handle_upx_unpack(arguments)
+    elif name == "unpack_detect_and_try":
+        return await _handle_unpack_detect_and_try(arguments)
+    # --- .NET Analysis ---
+    elif name == "dnspy_decompile":
+        return await _handle_dnspy_decompile(arguments)
+    # --- GUI Tool Launchers ---
+    elif name == "ida_launch_and_wait":
+        return await _handle_ida_launch_and_wait(arguments)
+    elif name == "windbg_launch":
+        return await _handle_windbg_launch(arguments)
+    # --- IDA Pro Proxy ---
+    elif name == "ida_get_metadata":
+        return await _handle_ida_get_metadata(arguments)
+    elif name == "ida_list_functions":
+        return await _handle_ida_list_functions(arguments)
+    elif name == "ida_decompile_function":
+        return await _handle_ida_decompile_function(arguments)
+    elif name == "ida_disassemble_function":
+        return await _handle_ida_disassemble_function(arguments)
+    elif name == "ida_list_strings":
+        return await _handle_ida_list_strings(arguments)
+    elif name == "ida_set_comment":
+        return await _handle_ida_set_comment(arguments)
+    elif name == "ida_rename_function":
+        return await _handle_ida_rename_function(arguments)
+    # --- Composite Playbooks ---
+    elif name == "triage_full":
+        return await _handle_triage_full(arguments)
+    elif name == "behavioral_full":
+        return await _handle_behavioral_full(arguments)
+    elif name == "persistence_audit":
+        return await _handle_persistence_audit(arguments)
+    elif name == "injection_scan_all":
+        return await _handle_injection_scan_all(arguments)
+    elif name == "execute_with_monitoring":
+        return await _handle_execute_with_monitoring(arguments)
+    elif name == "autoruns_analyze":
+        return await _handle_autoruns_analyze(arguments)
+    else:
+        return _text("Unknown tool: {}".format(name))
 
 
 # ========================== HANDLER IMPLEMENTATIONS =======================
@@ -1480,67 +1836,57 @@ async def _handle_entropy_analysis(args):
 
 
 # 15. procmon_start
+async def _poll_file_nonempty(path, attempts=15, interval=2):
+    """Poll until a file on FlareVM exists and is non-empty. Returns its size or 0."""
+    for _ in range(attempts):
+        await asyncio.sleep(interval)
+        out, _, _ = await run_ps_async(
+            'if (Test-Path "{0}") {{ (Get-Item "{0}").Length }} else {{ 0 }}'.format(path),
+            timeout=10)
+        try:
+            size = int(out.strip().split("\n")[0])
+        except (ValueError, IndexError):
+            size = 0
+        if size > 0:
+            return size
+    return 0
+
+
 async def _handle_procmon_start(args):
     output_path = args.get("output_path", "C:\\temp\\procmon.pml")
     process_filter = args.get("process_filter", "")
     procmon_path = await resolve_tool_path("procmon", "Procmon")
 
     await run_ps_async('New-Item -ItemType Directory -Path "C:\\temp" -Force | Out-Null', timeout=10)
-
-    # Kill any existing procmon
+    # Kill any existing procmon and clear the stale backing file so our poll
+    # detects the fresh one.
     await run_ps_async('Stop-Process -Name Procmon* -Force -ErrorAction SilentlyContinue', timeout=15)
     await asyncio.sleep(1)
+    await run_ps_async('Remove-Item "{}" -Force -ErrorAction SilentlyContinue'.format(output_path), timeout=10)
 
+    # ProcMon needs an INTERACTIVE desktop to load its driver and (crucially) to
+    # convert the log later, so launch it through a scheduled task in the
+    # console session rather than Start-Process in the non-interactive WinRM
+    # (session 0) context. CLI filtering requires a *binary* .pmc — the old XML
+    # /LoadConfig silently disabled capture — so we capture everything and let
+    # procmon_stop summarise per process instead.
+    pm_args = '/BackingFile "{}" /Quiet /Minimized /AcceptEula'.format(output_path)
+    await launch_gui_app(procmon_path, arguments=pm_args, task_name="MCP_Procmon")
+
+    size = await _poll_file_nonempty(output_path, attempts=10, interval=2)
+
+    note = ""
     if process_filter:
-        # Create a ProcMon Configuration (PMC) file with filter
-        pmc_script = """
-# Create a simple Procmon filter config
-$filterXml = @"
-<procmon>
-  <filters>
-    <filter>
-      <column>Process Name</column>
-      <relation>is</relation>
-      <action>include</action>
-      <value>{filter}</value>
-    </filter>
-    <filter>
-      <column>Process Name</column>
-      <relation>is</relation>
-      <action>exclude</action>
-      <value>Procmon.exe</value>
-    </filter>
-    <filter>
-      <column>Process Name</column>
-      <relation>is</relation>
-      <action>exclude</action>
-      <value>Procmon64.exe</value>
-    </filter>
-    <filter>
-      <column>Process Name</column>
-      <relation>is</relation>
-      <action>exclude</action>
-      <value>System</value>
-    </filter>
-  </filters>
-</procmon>
-"@
-$filterXml | Out-File -FilePath "C:\\temp\\procmon_filter.pmc" -Encoding UTF8
-Start-Process -FilePath "{procmon}" -ArgumentList "/BackingFile `"{output}`" /LoadConfig `"C:\\temp\\procmon_filter.pmc`" /Minimized /Quiet /AcceptEula" -NoNewWindow
-Write-Output "ProcMon started with filter: {filter}"
-Write-Output "Output: {output}"
-""".format(filter=process_filter, procmon=procmon_path, output=output_path)
-    else:
-        pmc_script = """
-Start-Process -FilePath "{procmon}" -ArgumentList "/BackingFile `"{output}`" /Minimized /Quiet /AcceptEula" -NoNewWindow
-Write-Output "ProcMon started (no filter)"
-Write-Output "Output: {output}"
-""".format(procmon=procmon_path, output=output_path)
-
-    stdout, stderr, code = await run_ps_async(pmc_script, timeout=30)
-    if code != 0:
-        return _text("ProcMon start failed: {} {}".format(stderr, stdout))
-    return _text(stdout)
+        note = ("\nNote: capture is unfiltered (CLI filtering needs a binary .pmc); "
+                "the requested filter '{}' is ignored — procmon_stop lists all "
+                "processes seen.".format(process_filter))
+    if size > 0:
+        return _text("=== ProcMon Started (interactive session) ===\n"
+                     "Backing file: {} ({} bytes preallocated)\n"
+                     "Capturing all process activity. Use procmon_stop to "
+                     "terminate and export.{}".format(output_path, size, note))
+    return _text("WARNING: ProcMon launched but backing file {} did not appear; "
+                 "capture may not have started.{}".format(output_path, note))
 
 
 # 16. procmon_stop
@@ -1549,45 +1895,58 @@ async def _handle_procmon_stop(args):
     csv_path = args.get("csv_path", "C:\\temp\\procmon.csv")
     procmon_path = await resolve_tool_path("procmon", "Procmon")
 
+    # Clear any stale CSV so the poll below sees the fresh export.
+    await run_ps_async('Remove-Item "{}" -Force -ErrorAction SilentlyContinue'.format(csv_path), timeout=10)
+
+    # Stop the running capture. /Terminate must also run in the interactive
+    # session to reach the capturing instance and flush the PML.
+    await launch_gui_app(procmon_path, arguments="/Terminate", task_name="MCP_ProcmonTerm")
+    for _ in range(15):
+        await asyncio.sleep(2)
+        out, _, _ = await run_ps_async(
+            '(Get-Process Procmon* -ErrorAction SilentlyContinue | Measure-Object).Count', timeout=10)
+        if out.strip().split("\n")[0] == "0":
+            break
+
+    # Convert PML -> CSV. /OpenLog + /SaveAs renders through the GUI, so it too
+    # needs the interactive desktop; launch it the same way and poll for the
+    # output file rather than blocking on the (headless-hanging) call.
+    conv_args = '/OpenLog "{}" /SaveAs "{}" /AcceptEula'.format(pml_path, csv_path)
+    await launch_gui_app(procmon_path, arguments=conv_args, task_name="MCP_ProcmonConv")
+    csv_size = await _poll_file_nonempty(csv_path, attempts=45, interval=2)
+    # Ensure the conversion instance has exited.
+    await run_ps_async('Stop-Process -Name Procmon* -Force -ErrorAction SilentlyContinue', timeout=10)
+
+    if csv_size == 0:
+        exists, _, _ = await run_ps_async('Test-Path "{}"'.format(pml_path), timeout=10)
+        return _text("WARNING: CSV export not produced at {} (PML exists: {}). "
+                     "The interactive conversion may still be running.".format(
+                         csv_path, exists.strip()))
+
+    # Parse the CSV summary — plain file reads work fine over WinRM.
     ps = """
-# Terminate ProcMon
-& "{procmon}" /Terminate 2>&1 | Out-Null
-Start-Sleep -Seconds 3
+$lines = Get-Content "{csv}" -TotalCount 10001
+$total = $lines.Count - 1
+$fileOps = ($lines | Select-String -Pattern "CreateFile|WriteFile|ReadFile|DeleteFile|SetDispositionInformationFile" | Measure-Object).Count
+$regOps = ($lines | Select-String -Pattern "RegOpenKey|RegSetValue|RegQueryValue|RegCreateKey|RegDeleteKey" | Measure-Object).Count
+$netOps = ($lines | Select-String -Pattern "TCP|UDP|Send|Recv" | Measure-Object).Count
+$procOps = ($lines | Select-String -Pattern "Process Create|Process Start|Thread Create|Load Image" | Measure-Object).Count
 
-# Export PML to CSV
-& "{procmon}" /OpenLog "{pml}" /SaveAs "{csv}" /AcceptEula 2>&1 | Out-Null
-Start-Sleep -Seconds 5
-
-# Parse CSV and generate summary
-if (Test-Path "{csv}") {{
-    $lines = Get-Content "{csv}" -TotalCount 10001
-    $total = $lines.Count - 1
-    $fileOps = ($lines | Select-String -Pattern "CreateFile|WriteFile|ReadFile|DeleteFile|SetDispositionInformationFile" | Measure-Object).Count
-    $regOps = ($lines | Select-String -Pattern "RegOpenKey|RegSetValue|RegQueryValue|RegCreateKey|RegDeleteKey" | Measure-Object).Count
-    $netOps = ($lines | Select-String -Pattern "TCP|UDP|Send|Recv" | Measure-Object).Count
-    $procOps = ($lines | Select-String -Pattern "Process Create|Process Start|Thread Create|Load Image" | Measure-Object).Count
-
-    Write-Output "=== ProcMon Summary ==="
-    Write-Output "PML: {pml}"
-    Write-Output "CSV: {csv}"
-    Write-Output "Total events (up to 10000): $total"
-    Write-Output ""
-    Write-Output "--- Operation Breakdown ---"
-    Write-Output "File operations:     $fileOps"
-    Write-Output "Registry operations: $regOps"
-    Write-Output "Network operations:  $netOps"
-    Write-Output "Process operations:  $procOps"
-    Write-Output ""
-
-    # Show unique processes
-    $procs = $lines | ForEach-Object {{ ($_ -split ',')[1] }} | Sort-Object -Unique | Where-Object {{ $_ -and $_ -ne '"Process Name"' }}
-    Write-Output "--- Unique Processes ---"
-    $procs | ForEach-Object {{ Write-Output "  $_" }}
-}} else {{
-    Write-Output "WARNING: CSV export file not found at {csv}"
-    Write-Output "PML file exists: $(Test-Path '{pml}')"
-}}
-""".format(procmon=procmon_path, pml=pml_path, csv=csv_path)
+Write-Output "=== ProcMon Summary ==="
+Write-Output "PML: {pml}"
+Write-Output "CSV: {csv} ({csvsize} bytes)"
+Write-Output "Total events (up to 10000): $total"
+Write-Output ""
+Write-Output "--- Operation Breakdown ---"
+Write-Output "File operations:     $fileOps"
+Write-Output "Registry operations: $regOps"
+Write-Output "Network operations:  $netOps"
+Write-Output "Process operations:  $procOps"
+Write-Output ""
+$procs = $lines | ForEach-Object {{ ($_ -split ',')[1] }} | Sort-Object -Unique | Where-Object {{ $_ -and $_ -ne '"Process Name"' }}
+Write-Output "--- Unique Processes ---"
+$procs | ForEach-Object {{ Write-Output "  $_" }}
+""".format(pml=pml_path, csv=csv_path, csvsize=csv_size)
 
     stdout, stderr, code = await run_ps_async(ps, timeout=120)
     result = stdout
@@ -1619,17 +1978,17 @@ if (Test-Path "{csv}") {{
 async def _handle_process_hacker_info(args):
     pid = args["pid"]
     ps = """
-$pid = {pid}
-$proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
-if (-not $proc) {{ Write-Error "Process $pid not found"; exit 1 }}
+$targetPid = {pid}
+$proc = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
+if (-not $proc) {{ Write-Error "Process $targetPid not found"; exit 1 }}
 
-$wmi = Get-WmiObject Win32_Process -Filter "ProcessId=$pid"
+$wmi = Get-WmiObject Win32_Process -Filter "ProcessId=$targetPid"
 
-Write-Output "=== Process Details: $($proc.ProcessName) (PID: $pid) ==="
+Write-Output "=== Process Details: $($proc.ProcessName) (PID: $targetPid) ==="
 Write-Output ""
 Write-Output "--- Basic Info ---"
 Write-Output "Name:         $($proc.ProcessName)"
-Write-Output "PID:          $pid"
+Write-Output "PID:          $targetPid"
 Write-Output "Parent PID:   $($wmi.ParentProcessId)"
 Write-Output "Command Line: $($wmi.CommandLine)"
 Write-Output "Path:         $($proc.Path)"
@@ -1650,7 +2009,7 @@ if ($proc.Modules.Count -gt 30) {{
 Write-Output ""
 
 Write-Output "--- Network Connections ---"
-$connections = Get-NetTCPConnection -OwningProcess $pid -ErrorAction SilentlyContinue
+$connections = Get-NetTCPConnection -OwningProcess $targetPid -ErrorAction SilentlyContinue
 if ($connections) {{
     $connections | ForEach-Object {{
         Write-Output "  $($_.State): $($_.LocalAddress):$($_.LocalPort) -> $($_.RemoteAddress):$($_.RemotePort)"
@@ -1659,7 +2018,7 @@ if ($connections) {{
     Write-Output "  No TCP connections"
 }}
 
-$udp = Get-NetUDPEndpoint -OwningProcess $pid -ErrorAction SilentlyContinue
+$udp = Get-NetUDPEndpoint -OwningProcess $targetPid -ErrorAction SilentlyContinue
 if ($udp) {{
     $udp | ForEach-Object {{
         Write-Output "  UDP: $($_.LocalAddress):$($_.LocalPort)"
@@ -1753,7 +2112,67 @@ async def _handle_fakenet_start(args):
             if p.isdigit():
                 excluded.append(int(p))
 
-    config = generate_fakenet_config(excluded)
+    # Determine the analyst (Kali) host IP from the live WinRM connection so the
+    # FakeNet HostBlackList actually shields it. The previous code passed the
+    # port list positionally as kali_ip, producing an invalid HostBlackList.
+    kali_ip = None
+    try:
+        ip_out, _, _ = await run_ps_async(
+            "(Get-NetTCPConnection -LocalPort 5985 -State Established "
+            "-ErrorAction SilentlyContinue | Select-Object -First 1).RemoteAddress",
+            timeout=15)
+        ip_out = ip_out.strip().split("\n")[0].strip()
+        if ip_out.count(".") == 3:
+            kali_ip = ip_out
+    except Exception:
+        kali_ip = None
+
+    # ── Option C: idempotent default-gateway + DNS self-heal ──────────────────
+    # FakeNet-NG 3.5 requires a default route for its WFP diverter to classify
+    # traffic as "external". Without one it prints "No gateways configured" and
+    # only intercepts localhost traffic. We add a fake next-hop derived from the
+    # VM's own IP (replace last octet with .1 — works for any /8–/30 setup).
+    # The fake GW doesn't need to be reachable; FakeNet's kernel hook fires first.
+    # Both ActiveStore (immediate) and persistent via `route -p` (survives
+    # reboot/snapshot restore).
+    ps_gw = r"""
+# Use the existing default gateway if one already exists; otherwise derive one
+# from the VM's primary IPv4 address (replace last octet with .1).
+$existingGw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+               Sort-Object RouteMetric | Select-Object -First 1).NextHop
+if ($existingGw -and $existingGw -ne '0.0.0.0') {
+    # A real (or previously-added) gateway already routes external traffic.
+    Write-Output "GW_OK: default route already present via $existingGw — no change needed"
+} else {
+    # Derive fake gateway from the VM's primary non-loopback IPv4 address.
+    $vmIp = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+             Where-Object { $_.IPAddress -notmatch '^127\.' -and $_.PrefixOrigin -ne 'WellKnown' } |
+             Sort-Object InterfaceIndex | Select-Object -First 1).IPAddress
+    if (-not $vmIp) {
+        Write-Output "GW_WARN: could not determine VM IP — FakeNet may only intercept local traffic"
+    } else {
+        $octets = $vmIp -split '\.'
+        $gw = "$($octets[0]).$($octets[1]).$($octets[2]).1"
+        $ifIdx = (Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } |
+                  Sort-Object InterfaceIndex | Select-Object -First 1).InterfaceIndex
+        New-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $ifIdx -NextHop $gw `
+            -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null
+        & route -p add 0.0.0.0 mask 0.0.0.0 $gw metric 1 | Out-Null
+        # Verify
+        $check = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+                  Where-Object { $_.NextHop -eq $gw } | Select-Object -First 1)
+        if ($check) {
+            Write-Output "GW_ADDED: fake gateway $gw derived from VM IP $vmIp (active + persistent)"
+        } else {
+            Write-Output "GW_WARN: could not add default route via $gw — FakeNet may only intercept local traffic"
+        }
+    }
+}
+"""
+    gw_out, gw_err, _ = await run_ps_async(ps_gw, timeout=20)
+    gw_status = gw_out.strip().split("\n")[0].strip()
+
+    config = generate_fakenet_config(kali_ip=kali_ip, excluded_ports=excluded)
 
     # Write config to FlareVM
     config_escaped = config.replace("'", "''")
@@ -1768,7 +2187,16 @@ Write-Output "Config written to C:\\temp\\fakenet_mcp.ini"
     if code != 0:
         return _text("Failed to write FakeNet config: {} {}".format(stderr, stdout))
 
-    # Launch FakeNet via scheduled task (needs interactive session for DNS interception)
+    # Clear stale capture artifacts so fakenet_stop reports only this run.
+    await run_ps_async(
+        'New-Item -ItemType Directory -Path "C:\\temp\\fakenet_logs" -Force | Out-Null; '
+        'Remove-Item "C:\\temp\\fakenet_logs\\*" -Recurse -Force -ErrorAction SilentlyContinue',
+        timeout=20)
+
+    # Launch FakeNet directly via scheduled task — it needs the interactive
+    # session for DNS/driver interception. (A .bat wrapper to redirect the
+    # console is unreliable through Task Scheduler, so we collect FakeNet's
+    # own pcap/dump artifacts in fakenet_stop instead.)
     fakenet_path = await resolve_tool_path("fakenet", "fakenet")
     result = await launch_gui_app(
         fakenet_path,
@@ -1778,84 +2206,60 @@ Write-Output "Config written to C:\\temp\\fakenet_mcp.ini"
     await asyncio.sleep(3)
 
     return _text("=== FakeNet-NG Started ===\n"
+                 "Gateway pre-flight: {}\n"
                  "Config: C:\\temp\\fakenet_mcp.ini\n"
                  "Excluded ports: {}\n"
                  "Task: {}\n\n"
                  "FakeNet is now intercepting network traffic.\n"
                  "Use fakenet_stop to retrieve logs.".format(
+                     gw_status,
                      ",".join(str(p) for p in excluded), result
                  ))
 
 
 # 21. fakenet_stop
 async def _handle_fakenet_stop(args):
-    ps = """
-# Kill FakeNet
+    ps = r"""
+# Stop the scheduled task and the FakeNet process tree. FakeNet-NG runs as a
+# PyInstaller bundle named fakenet.exe; the .bat launcher may have spawned it.
+Unregister-ScheduledTask -TaskName "MCP_FakeNet" -Confirm:$false -ErrorAction SilentlyContinue
 Stop-Process -Name "fakenet*" -Force -ErrorAction SilentlyContinue
-Stop-Process -Name "python*" -Force -ErrorAction SilentlyContinue  # FakeNet runs via Python sometimes
 Start-Sleep -Seconds 2
 
 Write-Output "=== FakeNet-NG Stopped ==="
 Write-Output ""
 
-# Find FakeNet output directory
-$logDirs = @(
-    "C:\\Tools\\fakenet\\fakenet_logs",
-    "$env:LOCALAPPDATA\\FakeNet-NG\\logs",
-    "C:\\temp\\fakenet_logs"
-)
-
-$foundLogs = $false
-foreach ($logDir in $logDirs) {
-    $latest = Get-ChildItem -Path $logDir -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if ($latest) {
-        $foundLogs = $true
-        Write-Output "--- Log Directory: $($latest.FullName) ---"
-        Write-Output ""
-
-        # DNS queries
-        $dnsLog = Get-ChildItem -Path $latest.FullName -Filter "*dns*" -ErrorAction SilentlyContinue
-        if ($dnsLog) {
-            Write-Output "--- DNS Queries ---"
-            Get-Content $dnsLog.FullName -TotalCount 50 -ErrorAction SilentlyContinue
-            Write-Output ""
-        }
-
-        # HTTP requests
-        $httpLogs = Get-ChildItem -Path $latest.FullName -Filter "*http*" -ErrorAction SilentlyContinue
-        if ($httpLogs) {
-            Write-Output "--- HTTP Activity ---"
-            foreach ($h in $httpLogs) {
-                Write-Output "File: $($h.Name) ($($h.Length) bytes)"
-                if ($h.Length -lt 10000) {
-                    Get-Content $h.FullName -ErrorAction SilentlyContinue
-                }
-            }
-            Write-Output ""
-        }
-
-        # All log files
-        Write-Output "--- All Captured Files ---"
-        Get-ChildItem -Path $latest.FullName -Recurse | ForEach-Object {
-            Write-Output "  $($_.Name) - $($_.Length) bytes - $($_.LastWriteTime)"
-        }
-
-        # Main FakeNet log
-        $mainLog = Join-Path $latest.FullName "fakenet.log"
-        if (Test-Path $mainLog) {
-            Write-Output ""
-            Write-Output "--- FakeNet Main Log (last 100 lines) ---"
-            Get-Content $mainLog -Tail 100 -ErrorAction SilentlyContinue
-        }
-        break
-    }
+# FakeNet-NG writes a packet capture (packets_*.pcap) and HTTP POST dumps to
+# its working directory. Launched via Task Scheduler that CWD is System32, so
+# sweep the likely locations for artifacts from the last 15 minutes.
+$cutoff = (Get-Date).AddMinutes(-15)
+$searchDirs = @("C:\temp\fakenet_logs", "C:\temp", "C:\Windows\System32",
+                "C:\Tools\fakenet\fakenet3.5",
+                "$env:LOCALAPPDATA\FakeNet-NG",
+                "$env:USERPROFILE\Desktop")
+$artifacts = foreach ($d in $searchDirs) {
+    Get-ChildItem -Path $d -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -gt $cutoff -and
+            ($_.Name -match 'packets_.*\.pcap$' -or $_.Name -match '^(http|nbns|dns|fakenet).*\.(txt|log|html)$') }
 }
-
-if (-not $foundLogs) {
-    Write-Output "No FakeNet log directory found. Checking running log files..."
-    Get-ChildItem -Path "C:\\temp" -Filter "fakenet*" -ErrorAction SilentlyContinue | ForEach-Object {
-        Write-Output "  $($_.Name) - $($_.Length) bytes"
+if ($artifacts) {
+    Write-Output "--- Captured FakeNet Artifacts ---"
+    $artifacts | Sort-Object LastWriteTime -Descending | ForEach-Object {
+        Write-Output "  $($_.FullName) - $($_.Length) bytes - $($_.LastWriteTime)"
     }
+    # Move the pcap(s) into the log dir for easy retrieval/download.
+    New-Item -ItemType Directory -Path "C:\temp\fakenet_logs" -Force | Out-Null
+    $artifacts | Where-Object { $_.Name -match 'packets_.*\.pcap$' } | ForEach-Object {
+        Move-Item $_.FullName -Destination "C:\temp\fakenet_logs\" -Force -ErrorAction SilentlyContinue
+    }
+    Write-Output ""
+    Write-Output "PCAP(s) moved to C:\temp\fakenet_logs\ (use download_file to retrieve)."
+} else {
+    Write-Output "No FakeNet capture artifacts found in the last 15 min."
+    Write-Output "Tip: FakeNet writes packets_*.pcap to its working directory (often"
+    Write-Output "C:\Tools\fakenet\fakenet3.5\ or C:\Windows\System32 when run via Task Scheduler)."
+    Write-Output "DNS interception is confirmed working; PCAP capture requires the WFP"
+    Write-Output "diverter to log traffic from an interactive-session process, not WinRM session 0."
 }
 """
     stdout, stderr, code = await run_ps_async(ps, timeout=60)
@@ -2059,7 +2463,11 @@ foreach ($key in $runKeys) {
 Write-Output ""
 Write-Output "Comparison complete."
 """
-        stdout, stderr, code = await run_ps_async(ps, timeout=180)
+        # This comparison script is large; send it as a staged file rather than
+        # inline so it doesn't blow the WinRM/cmd command-line length limit
+        # ("The command line is too long").
+        stdout, stderr, code = await run_ps_script(ps, timeout=180,
+                                                   script_name="regshot_compare.ps1")
         result = stdout
         if stderr:
             result += "\n--- Warnings ---\n" + stderr
@@ -2127,38 +2535,43 @@ if ($x64dbg) {{
 # 26. windbg_analyze_dump
 async def _handle_windbg_analyze_dump(args):
     dump_file = args["dump_file"]
-    commands = args.get("commands", "!analyze -v")
-    # Find cdb.exe
-    ps_find = """
-$paths = @(
-    "C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x64\\cdb.exe",
-    "C:\\Tools\\WinDbg\\cdb.exe",
-    "C:\\Program Files\\Windows Kits\\10\\Debuggers\\x64\\cdb.exe"
-)
-foreach ($p in $paths) { if (Test-Path $p) { Write-Output $p; exit 0 } }
-$w = where.exe cdb 2>$null | Select-Object -First 1
-if ($w) { Write-Output $w } else { Write-Output "NOT_FOUND" }
-"""
-    cdb_stdout, _, _ = await run_ps_async(ps_find, timeout=15)
-    cdb_path = cdb_stdout.strip().split("\n")[0].strip()
-    if cdb_path == "NOT_FOUND":
-        return _text("cdb.exe (WinDbg command-line) not found on FlareVM")
+    include_stack_trace = args.get("include_stack_trace", True)
+    include_modules = args.get("include_modules", True)
+    include_threads = args.get("include_threads", True)
+    symbols_path = args.get("symbols_path")
+    extra_commands = args.get("extra_commands") or []
 
-    # Build command string (semicolon-separated, ending with q to quit)
-    cmd_str = commands.strip()
-    if not cmd_str.endswith(";q") and not cmd_str.endswith("; q"):
-        cmd_str += "; q"
+    open_args = {
+        "dump_path": dump_file,
+        "include_stack_trace": include_stack_trace,
+        "include_modules": include_modules,
+        "include_threads": include_threads,
+    }
+    if symbols_path:
+        open_args["symbols_path"] = symbols_path
 
-    ps = '& "{}" -z "{}" -c "{}" 2>&1'.format(
-        cdb_path, dump_file.replace('"', '`"'), cmd_str.replace('"', '`"')
-    )
-    stdout, stderr, code = await run_ps_async(ps, timeout=180)
-    result = "=== WinDbg Analysis ===\nDump: {}\nCommands: {}\n\n{}".format(
-        dump_file, commands, stdout
-    )
-    if stderr:
-        result += "\n--- Warnings ---\n" + stderr
-    return _text(result)
+    try:
+        result = await windbg_rpc_call("open_windbg_dump", open_args, timeout=180)
+    except RuntimeError as e:
+        return _text("mcp-windbg error: {}\n\nHint: ensure MCP_WinDbg_Server scheduled task is running (setup.py provisions it).".format(e))
+
+    output = result if isinstance(result, str) else json.dumps(result, indent=2)
+
+    extra_output = ""
+    for cmd in extra_commands:
+        try:
+            cmd_result = await windbg_rpc_call("run_windbg_cmd", {
+                "dump_path": dump_file,
+                "command": cmd,
+            }, timeout=60)
+            cmd_text = cmd_result if isinstance(cmd_result, str) else json.dumps(cmd_result, indent=2)
+            extra_output += "\n\n--- {} ---\n{}".format(cmd, cmd_text)
+        except RuntimeError as e:
+            extra_output += "\n\n--- {} (error) ---\n{}".format(cmd, e)
+
+    return _text("=== WinDbg Analysis (mcp-windbg) ===\nDump: {}\n\n{}{}".format(
+        dump_file, output, extra_output
+    ))
 
 
 # 27. frida_list_processes
@@ -2184,7 +2597,7 @@ $scriptContent = @'
 $scriptPath = "C:\\temp\\frida_spawn_script.js"
 $scriptContent | Out-File -FilePath $scriptPath -Encoding UTF8
 Write-Output "Script saved to $scriptPath"
-$output = & frida -f "{exe}" -l $scriptPath --no-pause --timeout {timeout} 2>&1
+$output = & frida -f "{exe}" -l $scriptPath -q --timeout {timeout} 2>&1
 Write-Output $output
 """.format(script=script_escaped, exe=executable.replace('"', '`"'), timeout=timeout)
     stdout, stderr, code = await run_ps_async(ps, timeout=timeout + 60)
@@ -2207,7 +2620,7 @@ $scriptContent = @'
 $scriptPath = "C:\\temp\\frida_attach_script.js"
 $scriptContent | Out-File -FilePath $scriptPath -Encoding UTF8
 Write-Output "Script saved to $scriptPath"
-$output = & frida -p {pid} -l $scriptPath --no-pause --timeout {timeout} 2>&1
+$output = & frida -p {pid} -l $scriptPath -q --timeout {timeout} 2>&1
 Write-Output $output
 """.format(script=script_escaped, pid=pid, timeout=timeout)
     stdout, stderr, code = await run_ps_async(ps, timeout=timeout + 60)
@@ -2236,7 +2649,7 @@ $scriptContent = @'
 '@
 $scriptPath = "C:\\temp\\frida_run_script.js"
 $scriptContent | Out-File -FilePath $scriptPath -Encoding UTF8
-$output = & frida {target_flag} -l $scriptPath --no-pause --timeout {timeout} 2>&1
+$output = & frida {target_flag} -l $scriptPath -q --timeout {timeout} 2>&1
 Write-Output $output
 """.format(script=script_escaped, target_flag=target_flag, timeout=timeout)
     stdout, stderr, code = await run_ps_async(ps, timeout=timeout + 60)
@@ -2250,10 +2663,10 @@ Write-Output $output
 async def _handle_pe_sieve_scan(args):
     pid = args["pid"]
     output_dir = args.get("output_dir", "C:\\temp\\pe_sieve_output")
-    pe_sieve_path = await resolve_tool_path("pe_sieve", "pe-sieve64")
+    pe_sieve_path = await resolve_tool_path("pe_sieve", "pe-sieve")
     ps = """
 New-Item -ItemType Directory -Path "{output}" -Force | Out-Null
-$result = & "{tool}" /pid {pid} /dir "{output}" /shellc /iat 3 /data 3 2>&1
+$result = & "{tool}" /pid {pid} /dir "{output}" /shellc 3 /iat 3 /data 3 2>&1
 Write-Output "=== PE-sieve Scan (PID: {pid}) ==="
 Write-Output ""
 Write-Output $result
@@ -2273,10 +2686,10 @@ Get-ChildItem -Path "{output}" -Recurse -ErrorAction SilentlyContinue | ForEach-
 # 32. hollows_hunter_scan
 async def _handle_hollows_hunter_scan(args):
     output_dir = args.get("output_dir", "C:\\temp\\hollows_output")
-    hh_path = await resolve_tool_path("hollows_hunter", "hollows_hunter64")
+    hh_path = await resolve_tool_path("hollows_hunter", "hollows_hunter")
     ps = """
 New-Item -ItemType Directory -Path "{output}" -Force | Out-Null
-$result = & "{tool}" /dir "{output}" /shellc /iat 3 2>&1
+$result = & "{tool}" /dir "{output}" /shellc 3 /iat 3 2>&1
 Write-Output "=== Hollows Hunter Scan (All Processes) ==="
 Write-Output ""
 Write-Output $result
@@ -2505,124 +2918,150 @@ async def _handle_windbg_launch(args):
     dump_file = args["dump_file"]
     windbg_path = args.get("windbg_path", "C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x64\\windbg.exe")
 
-    # Check if windbg exists at the specified path, try alternatives
-    ps_find = """
-$paths = @(
-    "{windbg}",
-    "C:\\Tools\\WinDbg\\windbg.exe",
-    "C:\\Program Files\\Windows Kits\\10\\Debuggers\\x64\\windbg.exe"
-)
-foreach ($p in $paths) {{ if (Test-Path $p) {{ Write-Output $p; exit 0 }} }}
-$w = where.exe windbg 2>$null | Select-Object -First 1
-if ($w) {{ Write-Output $w }} else {{ Write-Output "NOT_FOUND" }}
-""".format(windbg=windbg_path)
+    ps_find = (
+        "$paths = @(\n"
+        "    '{windbg}',\n"
+        "    'C:\\\\Program Files (x86)\\\\Windows Kits\\\\10\\\\Debuggers\\\\x64\\\\windbg.exe',\n"
+        "    'C:\\\\Program Files\\\\Windows Kits\\\\10\\\\Debuggers\\\\x64\\\\windbg.exe',\n"
+        "    \"$env:LOCALAPPDATA\\\\Microsoft\\\\WindowsApps\\\\WinDbgX.exe\"\n"
+        ")\n"
+        "foreach ($p in $paths) {{ if (Test-Path $p) {{ Write-Output $p; exit 0 }} }}\n"
+        "$w = where.exe windbg 2>$null | Select-Object -First 1\n"
+        "if ($w) {{ Write-Output $w }} else {{ Write-Output 'NOT_FOUND' }}\n"
+    ).format(windbg=windbg_path.replace("'", "''"))
     stdout, _, _ = await run_ps_async(ps_find, timeout=15)
     actual_path = stdout.strip().split("\n")[0].strip()
     if actual_path == "NOT_FOUND":
-        return _text("WinDbg not found on FlareVM")
+        return _text("WinDbg not found on FlareVM. Install via: winget install Microsoft.WinDbg")
 
     result = await launch_gui_app(
         actual_path,
         arguments='-z "{}"'.format(dump_file),
-        task_name="MCP_WinDbg",
+        task_name="MCP_WinDbg_GUI",
     )
     return _text("=== WinDbg Launched ===\nDump: {}\n{}".format(dump_file, result))
 
 
+# 37b. windbg_run_cmd
+async def _handle_windbg_run_cmd(args):
+    dump_file = args["dump_file"]
+    command = args["command"]
+    try:
+        cmd_result = await windbg_rpc_call("run_windbg_cmd", {
+            "dump_path": dump_file,
+            "command": command,
+        }, timeout=60)
+    except RuntimeError as e:
+        return _text("mcp-windbg error: {}\n\nHint: call windbg_analyze_dump first to open the session.".format(e))
+    output = cmd_result if isinstance(cmd_result, str) else json.dumps(cmd_result, indent=2)
+    return _text("=== WinDbg Command ===\nDump: {}\nCommand: {}\n\n{}".format(dump_file, command, output))
+
+
+# 37c. windbg_list_dumps
+async def _handle_windbg_list_dumps(args):
+    directory_path = args.get("directory_path")
+    list_args = {}
+    if directory_path:
+        list_args["directory_path"] = directory_path
+    try:
+        result = await windbg_rpc_call("list_windbg_dumps", list_args, timeout=30)
+    except RuntimeError as e:
+        return _text("mcp-windbg error: {}".format(e))
+    output = result if isinstance(result, str) else json.dumps(result, indent=2)
+    return _text("=== WinDbg Dump Files ===\n{}".format(output))
+
+
 # 38. ida_get_metadata
 async def _handle_ida_get_metadata(args):
-    result = await ida_rpc_call("get_metadata")
-    if "result" in result:
-        return _text("=== IDA Pro Metadata ===\n" + json.dumps(result["result"], indent=2))
-    return _text("IDA RPC response: " + json.dumps(result, indent=2))
+    md = await ida_rpc_call("get_metadata")
+    return _text("=== IDA Pro Metadata ===\n" + json.dumps(md, indent=2))
+
+
+def _ida_unwrap_list(res):
+    """The MCP list_* tools return {'data': [...], 'next_offset': N}."""
+    if isinstance(res, dict) and "data" in res:
+        return res["data"]
+    return res if isinstance(res, list) else [res]
 
 
 # 39. ida_list_functions
 async def _handle_ida_list_functions(args):
-    params = {}
-    if args.get("filter"):
-        params["filter"] = args["filter"]
-    if args.get("count"):
-        params["count"] = args["count"]
-    result = await ida_rpc_call("list_functions", params if params else None)
-    if "result" in result:
-        funcs = result["result"]
-        if isinstance(funcs, list):
-            lines = ["=== IDA Functions ({} found) ===".format(len(funcs)), ""]
-            for f in funcs:
-                if isinstance(f, dict):
-                    lines.append("  {}: {} (size: {})".format(
-                        f.get("address", "?"), f.get("name", "?"), f.get("size", "?")
-                    ))
-                else:
-                    lines.append("  " + str(f))
-            return _text("\n".join(lines))
-        return _text(json.dumps(funcs, indent=2))
-    return _text("IDA RPC response: " + json.dumps(result, indent=2))
+    offset = args.get("offset", 0)
+    count = args.get("count") or 100
+    flt = args.get("filter")
+    if flt:
+        res = await ida_rpc_call("list_functions_filter",
+                                 {"offset": offset, "count": count, "filter": flt})
+    else:
+        res = await ida_rpc_call("list_functions", {"offset": offset, "count": count})
+    funcs = _ida_unwrap_list(res)
+    lines = ["=== IDA Functions ({} shown) ===".format(len(funcs)), ""]
+    for f in funcs:
+        if isinstance(f, dict):
+            lines.append("  {}: {} (size: {})".format(
+                f.get("address", "?"), f.get("name", "?"), f.get("size", "?")))
+        else:
+            lines.append("  " + str(f))
+    return _text("\n".join(lines))
 
 
 # 40. ida_decompile_function
 async def _handle_ida_decompile_function(args):
-    result = await ida_rpc_call("decompile_function", {"function_name": args["function_name"]})
-    if "result" in result:
-        return _text("=== Decompiled: {} ===\n\n{}".format(
-            args["function_name"], result["result"]
-        ))
-    return _text("IDA RPC response: " + json.dumps(result, indent=2))
+    target = args["function_name"]
+    addr = await _ida_resolve_address(target)
+    code = await ida_rpc_call("decompile_function", {"address": addr})
+    body = code if isinstance(code, str) else json.dumps(code, indent=2)
+    return _text("=== Decompiled: {} ({}) ===\n\n{}".format(target, addr, body))
 
 
 # 41. ida_disassemble_function
 async def _handle_ida_disassemble_function(args):
-    result = await ida_rpc_call("disassemble_function", {"function_name": args["function_name"]})
-    if "result" in result:
-        return _text("=== Disassembly: {} ===\n\n{}".format(
-            args["function_name"], result["result"]
-        ))
-    return _text("IDA RPC response: " + json.dumps(result, indent=2))
+    target = args["function_name"]
+    addr = await _ida_resolve_address(target)
+    asm = await ida_rpc_call("disassemble_function", {"start_address": addr})
+    body = asm if isinstance(asm, str) else json.dumps(asm, indent=2)
+    return _text("=== Disassembly: {} ({}) ===\n\n{}".format(target, addr, body))
 
 
 # 42. ida_list_strings
 async def _handle_ida_list_strings(args):
-    params = {}
-    if args.get("filter"):
-        params["filter"] = args["filter"]
-    if args.get("count"):
-        params["count"] = args["count"]
-    result = await ida_rpc_call("list_strings", params if params else None)
-    if "result" in result:
-        strings = result["result"]
-        if isinstance(strings, list):
-            lines = ["=== IDA Strings ({} found) ===".format(len(strings)), ""]
-            for s in strings:
-                if isinstance(s, dict):
-                    lines.append("  {}: {}".format(s.get("address", "?"), s.get("value", "?")))
-                else:
-                    lines.append("  " + str(s))
-            return _text("\n".join(lines))
-        return _text(json.dumps(strings, indent=2))
-    return _text("IDA RPC response: " + json.dumps(result, indent=2))
+    offset = args.get("offset", 0)
+    count = args.get("count") or 100
+    flt = args.get("filter")
+    if flt:
+        res = await ida_rpc_call("list_strings_filter",
+                                 {"offset": offset, "count": count, "filter": flt})
+    else:
+        res = await ida_rpc_call("list_strings", {"offset": offset, "count": count})
+    strings = _ida_unwrap_list(res)
+    lines = ["=== IDA Strings ({} shown) ===".format(len(strings)), ""]
+    for s in strings:
+        if isinstance(s, dict):
+            val = s.get("string", s.get("value", s.get("text", "?")))
+            lines.append("  {}: {}".format(s.get("address", "?"), val))
+        else:
+            lines.append("  " + str(s))
+    return _text("\n".join(lines))
 
 
 # 43. ida_set_comment
 async def _handle_ida_set_comment(args):
-    result = await ida_rpc_call("set_comment", {
+    await ida_rpc_call("set_comment", {
         "address": args["address"],
         "comment": args["comment"],
     })
-    if "result" in result:
-        return _text("Comment set at {}: {}".format(args["address"], args["comment"]))
-    return _text("IDA RPC response: " + json.dumps(result, indent=2))
+    return _text("Comment set at {}: {}".format(args["address"], args["comment"]))
 
 
 # 44. ida_rename_function
 async def _handle_ida_rename_function(args):
-    result = await ida_rpc_call("rename_function", {
-        "old_name": args["old_name"],
+    old = args["old_name"]
+    addr = await _ida_resolve_address(old)
+    await ida_rpc_call("rename_function", {
+        "function_address": addr,
         "new_name": args["new_name"],
     })
-    if "result" in result:
-        return _text("Function renamed: {} -> {}".format(args["old_name"], args["new_name"]))
-    return _text("IDA RPC response: " + json.dumps(result, indent=2))
+    return _text("Function renamed: {} ({}) -> {}".format(old, addr, args["new_name"]))
 
 
 # 45. triage_full
@@ -2987,11 +3426,11 @@ if (Test-Path $scanDir) {
     Get-ChildItem -Path $scanDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
         $dirName = $_.Name
         if ($dirName -match '^(\d+)_') {
-            $pid = $Matches[1]
+            $targetPid = $Matches[1]
             $files = (Get-ChildItem -Path $_.FullName -File -ErrorAction SilentlyContinue | Measure-Object).Count
             if ($files -gt 0) {
-                $suspiciousPids += $pid
-                Write-Output "SUSPICIOUS: PID $pid ($dirName) - $files artifacts"
+                $suspiciousPids += $targetPid
+                Write-Output "SUSPICIOUS: PID $targetPid ($dirName) - $files artifacts"
             }
         }
     }
@@ -3033,6 +3472,150 @@ if ($suspiciousPids.Count -eq 0) {
     report.append("=" * 60)
 
     return _text("\n".join(report))
+
+
+# 49. execute_with_monitoring
+async def _handle_execute_with_monitoring(args):
+    executable = args["executable"]
+    arguments  = args.get("arguments", "")
+    duration   = int(args.get("duration", 30))
+
+    report = ["=" * 60, "EXECUTE WITH MONITORING", "=" * 60,
+              "Executable : {}".format(executable),
+              "Arguments  : {}".format(arguments or "(none)"),
+              "Duration   : {}s".format(duration), ""]
+
+    # 1. Start Procmon capture
+    report.append("--- [1/3] Starting Procmon capture ---")
+    try:
+        pm_result = await _handle_procmon_start({})
+        report.append(pm_result[0].text if pm_result else "Procmon start returned no output")
+    except Exception as e:
+        report.append("Procmon start warning: {}".format(e))
+    report.append("")
+
+    # 2. Launch the executable
+    report.append("--- [2/3] Launching {} ---".format(executable))
+    arg_clause = ""
+    if arguments:
+        arg_clause = " -ArgumentList '{}'".format(arguments.replace("'", "''"))
+    launch_ps = (
+        "$proc = Start-Process -FilePath '{exe}'{args} -PassThru -ErrorAction Stop\n"
+        "Write-Output \"PID: $($proc.Id)\"\n"
+        "Start-Sleep -Seconds {dur}\n"
+        "$proc.HasExited | Out-Null\n"
+        "Write-Output \"Exited: $($proc.HasExited)\""
+    ).format(exe=executable.replace("'", "''"), args=arg_clause, dur=duration)
+    try:
+        out, err, code = await run_ps_async(launch_ps, timeout=duration + 30)
+        report.append(out if out else "(no output)")
+        if err:
+            report.append("STDERR: " + err[:500])
+    except Exception as e:
+        report.append("Launch error: {}".format(e))
+    report.append("")
+
+    # 3. Stop Procmon and get summary
+    report.append("--- [3/3] Stopping Procmon and collecting results ---")
+    try:
+        stop_result = await _handle_procmon_stop({})
+        report.append(stop_result[0].text if stop_result else "Procmon stop returned no output")
+    except Exception as e:
+        report.append("Procmon stop error: {}".format(e))
+
+    report.extend(["", "=" * 60, "END OF EXECUTE WITH MONITORING", "=" * 60])
+    return _text("\n".join(report))
+
+
+# 50. autoruns_analyze
+async def _handle_autoruns_analyze(args):
+    verify_sigs = args.get("verify_signatures", True)
+    category    = args.get("category", "*")
+
+    # Locate autorunsc.exe
+    ps_find = r"""
+$candidates = @(
+    "C:\Tools\Sysinternals\autorunsc.exe",
+    "C:\Tools\SysinternalsSuite\autorunsc.exe",
+    "C:\ProgramData\chocolatey\bin\autorunsc.exe",
+    "C:\ProgramData\chocolatey\lib\autoruns\tools\autorunsc.exe",
+    "C:\Windows\System32\autorunsc.exe"
+)
+$found = $null
+foreach ($c in $candidates) { if (Test-Path $c) { $found = $c; break } }
+if (-not $found) {
+    $cmd = Get-Command autorunsc -ErrorAction SilentlyContinue
+    if ($cmd) { $found = $cmd.Source }
+}
+if ($found) { Write-Output $found } else { Write-Output "NOT_FOUND" }
+"""
+    path_out, _, _ = await run_ps_async(ps_find, timeout=15)
+    autorunsc_path = path_out.strip().split("\n")[0].strip()
+    if autorunsc_path == "NOT_FOUND" or not autorunsc_path:
+        return _text(
+            "ERROR: autorunsc.exe not found on FlareVM.\n"
+            "Install Autoruns from SysInternals or chocolatey:\n"
+            "  choco install autoruns -y\n"
+            "  # or download from https://learn.microsoft.com/en-us/sysinternals/downloads/autoruns"
+        )
+
+    # Build flags: -accepteula always; -a <category>; -s for sig check; -c for CSV output
+    sig_flag = "-s " if verify_sigs else ""
+    esc_path = autorunsc_path.replace("'", "''")
+    ps_run = (
+        "$out = & '{path}' -accepteula -a {cat} {sig}-c -nobanner 2>&1\n"
+        "Write-Output $out"
+    ).format(path=esc_path, cat=category, sig=sig_flag)
+
+    out, err, code = await run_ps_async(ps_run, timeout=120)
+    if not out.strip():
+        return _text("autoruns_analyze returned no output (stderr: {})".format(err[:300]))
+
+    # Parse CSV lines into a readable report
+    lines = out.strip().splitlines()
+    header = None
+    entries = []
+    for line in lines:
+        if not line.strip():
+            continue
+        if line.startswith('"Time"') or line.startswith("Time"):
+            header = [f.strip('"') for f in line.split(",")]
+            continue
+        if header:
+            cols = line.split(",")
+            cols = [c.strip('"') for c in cols]
+            row = dict(zip(header, cols))
+            entries.append(row)
+
+    if not entries:
+        return _text("Autoruns output (raw):\n" + out[:3000])
+
+    # Group by Category
+    by_cat = {}
+    for e in entries:
+        cat = e.get("Category", "?")
+        by_cat.setdefault(cat, []).append(e)
+
+    report_lines = [
+        "=== AUTORUNS ANALYSIS ===",
+        "Binary  : {}".format(autorunsc_path),
+        "Category: {}  |  Signatures: {}".format(category, verify_sigs),
+        "Total entries: {}".format(len(entries)),
+        "",
+    ]
+    for cat in sorted(by_cat):
+        report_lines.append("-- {} ({} entries) --".format(cat, len(by_cat[cat])))
+        for e in by_cat[cat]:
+            name      = e.get("Entry", e.get("Entry Name", "?"))
+            publisher = e.get("Publisher", "")
+            path      = e.get("Image Path", e.get("Launch String", ""))
+            sig       = e.get("Signer", "")
+            report_lines.append("  {:<40} {}".format(name[:40], path[:60]))
+            if publisher:
+                report_lines.append("    Publisher: {}  Signer: {}".format(publisher[:40], sig[:30]))
+        report_lines.append("")
+
+    return _text("\n".join(report_lines))
 
 
 # ========================== MCP PROMPTS ===================================
