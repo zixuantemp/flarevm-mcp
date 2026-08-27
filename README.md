@@ -234,29 +234,35 @@ print(f"✓ Credentials stored for {FLAREVM_USER}@{FLAREVM_HOST}")
 EOF
 ```
 
-### 4. Update Configuration
+### 4. Configuration (environment variables)
 
-Edit `server.py` to match your environment:
+No source edits are needed — everything is read from the environment of the
+MCP server process:
 
-```python
-FLAREVM_HOST = "192.168.100.10"      # Your FlareVM IP
-FLAREVM_USER = "xtemp"                # Your Windows username
-SMB_SHARE_NAME = "KaliShare"          # Your SMB share name
-SMB_LOCAL_PATH = "C:\\Share"          # SMB mount point on FlareVM
-```
+| Variable | Required | Default | Purpose |
+|----------|----------|---------|---------|
+| `FLAREVM_HOST` | **yes** | — | FlareVM IP. The server refuses to start without it (a stale hardcoded default used to fail as a silent WinRM timeout whenever the lab subnet changed). |
+| `FLAREVM_USER` | no | `xtemp` | Windows account used for WinRM/SMB |
+| `FLAREVM_PASSWORD` | no | keyring → `infected` | Password; prefer the keyring (`flarevm` / `$FLAREVM_USER`) |
+| `FLAREVM_SMB_SHARE` | no | `KaliShare` | SMB share name on the VM (uploads > 8 KB) |
+| `FLAREVM_SMB_LOCAL_PATH` | no | `C:\Share` | Path backing that share on the VM |
+| `KALI_IP` | no | auto | Analyst-host IP placed in FakeNet's `HostBlackList`. Auto-detected as the local address that routes to `FLAREVM_HOST`; set only if detection picks the wrong interface. |
+| `WINDBG_MCP_PORT` | no | `13338` | WinDbg MCP proxy port on the VM |
 
 ### 5. Configure MCP Server
 
 For use with Claude Code or other MCP clients, add to your MCP config:
 
-**For Claude Code** (`~/.claude/claude.json`):
+**For Claude Code** (`~/.claude.json`, or a project `.mcp.json`):
 ```json
 {
-  "mcp_servers": {
+  "mcpServers": {
     "flarevm": {
       "command": "python3",
       "args": ["/home/kali/mcp-flare/server.py"],
       "env": {
+        "FLAREVM_HOST": "192.168.100.10",
+        "FLAREVM_USER": "xtemp",
         "PYTHONUNBUFFERED": "1"
       }
     }
@@ -265,30 +271,25 @@ For use with Claude Code or other MCP clients, add to your MCP config:
 ```
 OR
 ```bash
-claude mcp add flare-mcp python3 /path/to/server.py
+claude mcp add flarevm -e FLAREVM_HOST=192.168.100.10 -e FLAREVM_USER=xtemp -- python3 /path/to/server.py
 ```
+
+`FLAREVM_HOST` must be in the `env` block — without it the server exits at
+startup. Note the key is `mcpServers` (camelCase).
 
 **For other MCP clients**, configure according to their documentation.
 
 ### 6. Verify Installation
 
 ```bash
-# Test connection
-python3 << 'EOF'
-import asyncio
-import json
-from pathlib import Path
-import sys
+# 1. The module must import cleanly with FLAREVM_HOST set (checks deps + config)
+cd /home/kali/mcp-flare
+FLAREVM_HOST=192.168.100.10 python3 -c "import server; print('✓ server loads; analyst IP ->', server._detect_kali_ip())"
 
-sys.path.insert(0, '/home/kali/mcp-flare')
+# 2. The VM must answer on WinRM (HTTP 405 on a bare GET is the healthy response)
+curl -s -o /dev/null -w 'WinRM -> HTTP %{http_code}\n' http://192.168.100.10:5985/wsman
 
-async def test():
-    # This will attempt to load the server
-    print("✓ Server module loads successfully")
-    print("✓ All dependencies installed")
-
-asyncio.run(test())
-EOF
+# 3. Then from your MCP client: check_connection
 ```
 
 ## Configuration Guide
@@ -598,6 +599,25 @@ Sample Upload → Static Analysis → Dynamic Analysis → Report Generation
 ## Troubleshooting
 
 ### Connection Issues
+
+**Problem**: "FLAREVM_HOST is not set" at startup / server disappears from the MCP client
+```
+Solution: Add FLAREVM_HOST to the MCP server's "env" block (see step 5).
+There is deliberately no default.
+```
+
+**Problem**: `check_connection` times out for 30s (looks like "VM busy")
+```
+Solution: Almost always a wrong/stale FLAREVM_HOST. Check the address, not the VM:
+ping <FLAREVM_HOST>
+curl -s -o /dev/null -w '%{http_code}\n' http://<FLAREVM_HOST>:5985/wsman   # expect 405
+```
+
+**Problem**: FakeNet intercepts Kali's own WinRM/SMB traffic (session hangs during fakenet_start)
+```
+Solution: HostBlackList got the wrong analyst IP. Set KALI_IP to the Kali address
+on the VM-facing interface (ip route get <FLAREVM_HOST> shows it).
+```
 
 **Problem**: "could not read Username for ... No such device or address"
 ```
