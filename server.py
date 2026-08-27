@@ -2,7 +2,7 @@
 r"""
 FlareVM MCP Server - Enhanced malware analysis bridge.
 
-Controls a Windows FlareVM malware analysis VM (192.168.100.10) via WinRM.
+Controls a Windows FlareVM malware analysis VM (address from the required FLAREVM_HOST env) via WinRM.
 Runs on Kali Linux. Exposes 48 tools to Claude Code for malware analysis.
 
 Transport: MCP stdio (stdin/stdout)
@@ -18,6 +18,7 @@ import json
 import logging
 import ntpath
 import os
+import socket
 import subprocess
 import sys
 import traceback
@@ -42,13 +43,38 @@ from mcp.types import (
 # ---------------------------------------------------------------------------
 
 # Configuration — environment variables override defaults
-FLAREVM_HOST = os.environ.get("FLAREVM_HOST", "192.168.100.10")
+FLAREVM_HOST = os.environ.get("FLAREVM_HOST")
+if not FLAREVM_HOST:
+    sys.exit(
+        "FLAREVM_HOST is not set. Export it or add it to the MCP server 'env' block "
+        "(e.g. \"FLAREVM_HOST\": \"192.168.167.10\"). No default: the lab subnet changes "
+        "and a stale address fails as a silent WinRM timeout."
+    )
 FLAREVM_USER = os.environ.get("FLAREVM_USER", "xtemp")
 FLAREVM_PASSWORD = None  # loaded lazily from keyring or FLAREVM_PASSWORD env
 
 SMB_SHARE_NAME = os.environ.get("FLAREVM_SMB_SHARE", "KaliShare")
 SMB_SHARE_PATH = "//{}/{}".format(FLAREVM_HOST, SMB_SHARE_NAME)
 SMB_LOCAL_PATH = os.environ.get("FLAREVM_SMB_LOCAL_PATH", "C:\\Share")
+
+
+def _detect_kali_ip():
+    """Return the analyst-host IP that faces FLAREVM_HOST.
+
+    Order: explicit ``KALI_IP`` env var → the local address the kernel would
+    route to FLAREVM_HOST (a UDP ``connect()`` sends no packets, it only
+    consults the routing table) → None. Never hardcode this: the lab subnet
+    changes and a stale value silently disables FakeNet's HostBlackList.
+    """
+    env_ip = os.environ.get("KALI_IP")
+    if env_ip:
+        return env_ip
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((FLAREVM_HOST, 5985))
+            return s.getsockname()[0]
+    except OSError:
+        return None
 
 IDA_MCP_PORT = 13337
 WINDBG_MCP_PORT = int(os.environ.get("WINDBG_MCP_PORT", "13338"))
@@ -489,12 +515,17 @@ def generate_fakenet_config(kali_ip=None, excluded_ports=None, excluded_processe
     defense-in-depth.
 
     Args:
-        kali_ip: IP of the analyst Kali machine (default: 192.168.110.134)
+        kali_ip: IP of the analyst Kali machine (default: KALI_IP env, else the
+            local address that routes to FLAREVM_HOST — see _detect_kali_ip)
         excluded_ports: Defense-in-depth port list (default: WinRM, SMB, IDA MCP)
         excluded_processes: Process names that handle control traffic
     """
     if kali_ip is None:
-        kali_ip = "192.168.110.134"
+        kali_ip = _detect_kali_ip()
+    if not kali_ip:
+        raise RuntimeError(
+            "Cannot determine the analyst host IP for FakeNet's HostBlackList "
+            "(no route to FLAREVM_HOST=%s). Set KALI_IP explicitly." % FLAREVM_HOST)
     if excluded_ports is None:
         excluded_ports = [5985, 5986, 445, 139, 13337]
     if excluded_processes is None:
