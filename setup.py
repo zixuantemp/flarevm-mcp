@@ -33,7 +33,7 @@ import textwrap
 import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_HOST = "192.168.100.10"
+DEFAULT_HOST = None  # no default on purpose — the lab subnet is site-specific
 DEFAULT_USER = "xtemp"
 DEFAULT_SHARE = "KaliShare"
 KEYRING_SERVICE = "flarevm"
@@ -471,7 +471,9 @@ def main():
     user  = args.user  or os.environ.get("FLAREVM_USER", DEFAULT_USER)
     share = args.share or os.environ.get("FLAREVM_SMB_SHARE", DEFAULT_SHARE)
 
-    host  = input(f"  FlareVM IP [{host}]: ").strip() or host
+    host  = input(f"  FlareVM IP [{host or 'required'}]: ").strip() or host
+    while not host:
+        host = input("  FlareVM IP (required): ").strip()
     user  = input(f"  Windows username [{user}]: ").strip() or user
     share = input(f"  SMB share name [{share}]: ").strip() or share
 

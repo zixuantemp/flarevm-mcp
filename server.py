@@ -42,20 +42,58 @@ from mcp.types import (
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Configuration — environment variables override defaults
-FLAREVM_HOST = os.environ.get("FLAREVM_HOST")
-if not FLAREVM_HOST:
-    sys.exit(
-        "FLAREVM_HOST is not set. Export it or add it to the MCP server 'env' block "
-        "(e.g. \"FLAREVM_HOST\": \"192.168.167.10\"). No default: the lab subnet changes "
-        "and a stale address fails as a silent WinRM timeout."
-    )
+# Configuration — process environment first, then an optional .env file next to
+# this script (written by setup.py; see .env.example). Nothing is hardcoded.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_DOTENV_PATH = os.path.join(_HERE, ".env")
+
+
+def _load_dotenv(path=_DOTENV_PATH):
+    """Populate os.environ from KEY=VALUE lines in .env without overriding
+    variables that are already set. Comments and blank lines are ignored.
+    Deliberately dependency-free so the server has no optional import path."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip("'\"")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except FileNotFoundError:
+        pass
+
+
+_load_dotenv()
+
+FLAREVM_HOST = os.environ.get("FLAREVM_HOST")  # validated in _require_host() at startup
 FLAREVM_USER = os.environ.get("FLAREVM_USER", "xtemp")
 FLAREVM_PASSWORD = None  # loaded lazily from keyring or FLAREVM_PASSWORD env
 
 SMB_SHARE_NAME = os.environ.get("FLAREVM_SMB_SHARE", "KaliShare")
-SMB_SHARE_PATH = "//{}/{}".format(FLAREVM_HOST, SMB_SHARE_NAME)
 SMB_LOCAL_PATH = os.environ.get("FLAREVM_SMB_LOCAL_PATH", "C:\\Share")
+
+
+def _smb_share_path():
+    """UNC path of the VM share, derived at call time from FLAREVM_HOST."""
+    return "//{}/{}".format(FLAREVM_HOST, SMB_SHARE_NAME)
+
+
+def _require_host():
+    """Startup guard: refuse to serve without a VM address.
+
+    Kept out of import time so the module stays importable (tests, CI,
+    tooling). A missing value fails here, loudly, instead of surfacing later
+    as a silent 30 s WinRM timeout against a stale address.
+    """
+    if not FLAREVM_HOST:
+        sys.exit(
+            "FLAREVM_HOST is not set. Put it in the MCP server 'env' block, export it, "
+            "or copy .env.example to .env next to server.py. There is deliberately no default."
+        )
 
 
 def _detect_kali_ip():
@@ -69,6 +107,8 @@ def _detect_kali_ip():
     env_ip = os.environ.get("KALI_IP")
     if env_ip:
         return env_ip
+    if not FLAREVM_HOST:
+        return None
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect((FLAREVM_HOST, 5985))
@@ -286,7 +326,7 @@ async def run_ps_script(script, timeout=300, script_name="mcp_script.ps1", force
 
     # SMB upload + Move-Item to final destination (mirrors _handle_upload_file)
     smb_cmd = [
-        "smbclient", SMB_SHARE_PATH,
+        "smbclient", _smb_share_path(),
         "-U", "{}%{}".format(FLAREVM_USER, _get_password()),
         "-c", 'put "{}" "{}"'.format(local_tmp, script_name),
     ]
@@ -352,8 +392,8 @@ async def ida_rpc_call(tool_name, arguments=None):
         raise RuntimeError("IDA RPC transport error: {} {}".format(stderr, stdout))
     try:
         envelope = json.loads(stdout)
-    except json.JSONDecodeError:
-        raise RuntimeError("IDA RPC: non-JSON response: {}".format(stdout[:500]))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("IDA RPC: non-JSON response: {}".format(stdout[:500])) from exc
     if isinstance(envelope, dict) and envelope.get("error"):
         err = envelope["error"]
         msg = err.get("message", err) if isinstance(err, dict) else err
@@ -429,8 +469,8 @@ async def windbg_rpc_call(tool_name, arguments=None, timeout=120):
         raise RuntimeError("mcp-windbg: empty stdout (code={}); stderr: {}".format(code, stderr[:300]))
     try:
         envelope = json.loads(stdout)
-    except json.JSONDecodeError:
-        raise RuntimeError("mcp-windbg: non-JSON response: {}".format(stdout[:500]))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("mcp-windbg: non-JSON response: {}".format(stdout[:500])) from exc
     if isinstance(envelope, dict) and envelope.get("error"):
         err = envelope["error"]
         msg = err.get("message", err) if isinstance(err, dict) else str(err)
@@ -1540,7 +1580,7 @@ async def _handle_upload_file(args):
 
     # Step 1: SMB put → //FlareVM/KaliShare → C:\Share\<filename>
     smb_cmd = [
-        "smbclient", SMB_SHARE_PATH,
+        "smbclient", _smb_share_path(),
         "-U", "{}%{}".format(FLAREVM_USER, _get_password()),
         "-c", 'put "{}" "{}"'.format(local_path, filename),
     ]
@@ -1614,7 +1654,7 @@ if (-not (Test-Path $p)) {{ Write-Error "File not found: $p"; exit 1 }}
     # Step 3: SMB get → local destination
     os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
     smb_cmd = [
-        "smbclient", SMB_SHARE_PATH,
+        "smbclient", _smb_share_path(),
         "-U", "{}%{}".format(FLAREVM_USER, _get_password()),
         "-c", 'get "{}" "{}"'.format(filename, local_path),
     ]
@@ -3615,7 +3655,7 @@ if ($found) { Write-Output $found } else { Write-Output "NOT_FOUND" }
         if header:
             cols = line.split(",")
             cols = [c.strip('"') for c in cols]
-            row = dict(zip(header, cols))
+            row = dict(zip(header, cols, strict=False))  # CSV rows may be ragged
             entries.append(row)
 
     if not entries:
@@ -3951,6 +3991,7 @@ async def main():
 
 def main_sync():
     """Synchronous entry point for console_scripts."""
+    _require_host()
     asyncio.run(main())
 
 

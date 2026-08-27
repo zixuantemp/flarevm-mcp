@@ -28,6 +28,41 @@ jobs:
               assert required in handler_names, f"Missing {required} (have: {handler_names})"
           print(f"OK — {len(handlers)} MCP handlers registered:", sorted(handler_names))
           PY
+      - name: Configuration contract
+        run: |
+          python <<'PY'
+          import os, subprocess, sys, tempfile
+          # 1. Importable with no configuration at all (tooling, tests) …
+          os.environ.pop("FLAREVM_HOST", None)
+          import server
+          assert server.FLAREVM_HOST is None
+          # 2. … but refuses to *serve* without a VM address, loudly.
+          r = subprocess.run([sys.executable, "-c", "import server; server._require_host()"],
+                             capture_output=True, text=True, env={k: v for k, v in os.environ.items() if k != "FLAREVM_HOST"})
+          assert r.returncode != 0 and "FLAREVM_HOST" in (r.stdout + r.stderr), r
+          # 3. .env is honoured and never overrides the process environment.
+          with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
+              f.write("FLAREVM_HOST=10.0.0.9\nFLAREVM_SMB_SHARE=Alt\n# comment\n"); path = f.name
+          os.environ["FLAREVM_SMB_SHARE"] = "FromEnv"
+          server._load_dotenv(path)
+          assert os.environ["FLAREVM_HOST"] == "10.0.0.9" and os.environ["FLAREVM_SMB_SHARE"] == "FromEnv"
+          # 4. No hardcoded lab addresses anywhere in the server.
+          import re
+          src = open("server.py").read()
+          hits = [m for m in re.findall(r"\b(?:192\.168|10\.\d+|172\.(?:1[6-9]|2\d|3[01]))\.\d+\.\d+\b", src)]
+          assert not hits, f"private-range IP literals in server.py: {hits}"
+          print("configuration contract OK")
+          PY
+      - name: docs/TOOLS.md matches registered tools
+        run: |
+          python <<'PY'
+          import re
+          src = open("server.py").read(); doc = open("docs/TOOLS.md").read()
+          in_src = set(re.findall(r'Tool\(\s*name="([a-z0-9_]+)"', src))
+          in_doc = set(re.findall(r"^\| `([a-z0-9_]+)` \|", doc, re.M))
+          assert in_src == in_doc, f"undocumented: {sorted(in_src - in_doc)}  stale: {sorted(in_doc - in_src)}"
+          print(f"docs/TOOLS.md in sync ({len(in_src)} tools)")
+          PY
   lint:
     runs-on: ubuntu-latest
     steps:
