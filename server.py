@@ -6,7 +6,7 @@ Controls a Windows FlareVM malware analysis VM (address from the required FLAREV
 Runs on Kali Linux. Exposes 48 tools to Claude Code for malware analysis.
 
 Transport: MCP stdio (stdin/stdout)
-Control: WinRM (pywinrm, plaintext transport)
+Control: WinRM (pywinrm, ntlm transport)
 File transfer: SMB only (//FlareVM/KaliShare -> C:\Share)
 GUI tools: Windows Scheduled Tasks for interactive session
 IDA Pro: Proxy to IDA MCP server on FlareVM (HTTP JSON-RPC port 13337)
@@ -248,7 +248,7 @@ def get_session():
         _session = winrm.Session(
             FLAREVM_HOST,
             auth=(FLAREVM_USER, _get_password()),
-            transport="plaintext",
+            transport="ntlm",
         )
     return _session
 
