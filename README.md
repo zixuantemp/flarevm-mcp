@@ -21,7 +21,7 @@ Claude / MCP client ──stdio──▶ flarevm-mcp (Kali) ──WinRM 5985─�
 ```bash
 git clone https://github.com/zixuantemp/flarevm-mcp.git && cd flarevm-mcp
 pip install -e .            # deps: mcp, pywinrm, keyring, requests
-python3 setup.py            # stores the VM password in your keyring, enables WinRM + the
+python3 flarevm_setup.py            # stores the VM password in your keyring, enables WinRM + the
                             # SMB share on the VM, writes .env, prints the MCP client snippet
 ```
 

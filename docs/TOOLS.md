@@ -73,7 +73,7 @@ Paths on the VM are always Windows paths — escape backslashes in JSON.
 | `x64dbg_run_script` | Save and execute an x64dbg script. |
 | `windbg_launch` | Launch WinDbg GUI with a dump file in the interactive console session. |
 | `windbg_list_dumps` | List .dmp crash dump files on FlareVM via mcp-windbg. |
-| `windbg_analyze_dump` | Open a crash/memory dump via mcp-windbg (cdb.exe) on FlareVM and run initial  triage. Returns crash info, call stack, loaded modules and threads.  Requires mcp-windbg HTTP server running on port 13338 (registered as  MCP_WinDbg_Server scheduled task by setup.py). |
+| `windbg_analyze_dump` | Open a crash/memory dump via mcp-windbg (cdb.exe) on FlareVM and run initial  triage. Returns crash info, call stack, loaded modules and threads.  Requires mcp-windbg HTTP server running on port 13338 (registered as  MCP_WinDbg_Server scheduled task by flarevm_setup.py). |
 | `windbg_run_cmd` | Run an arbitrary cdb command on an already-opened dump session in mcp-windbg.  Call windbg_analyze_dump first to open the session; subsequent windbg_run_cmd  calls on the same dump_file reuse the persistent cdb.exe process. |
 
 ## Frida instrumentation

@@ -9,8 +9,8 @@
   [CONFIGURATION.md → Lab network](CONFIGURATION.md#lab-network))
 
 **FlareVM** (Windows 10/11 with [FlareVM](https://github.com/mandiant/flare-vm) installed)
-- WinRM enabled with Basic auth over HTTP (5985) — `setup.py` does this for you
-- SMB share `KaliShare` → `C:\Share` (optional; `setup.py` creates it)
+- WinRM enabled with Basic auth over HTTP (5985) — `flarevm_setup.py` does this for you
+- SMB share `KaliShare` → `C:\Share` (optional; `flarevm_setup.py` creates it)
 - The analysis binaries under `C:\Tools\…` listed in
   [../resources/tools-reference.md](../resources/tools-reference.md)
 - IDA Pro + the [IDA MCP plugin](https://github.com/mandiant/ida-pro-mcp) only if you use the
@@ -26,10 +26,10 @@
 git clone https://github.com/zixuantemp/flarevm-mcp.git
 cd flarevm-mcp
 pip install -e .            # or: python3 -m venv .venv && . .venv/bin/activate && pip install -e .
-python3 setup.py            # --host, --user, --share, --skip-provision are optional flags
+python3 flarevm_setup.py            # --host, --user, --share, --skip-provision are optional flags
 ```
 
-`setup.py` will:
+`flarevm_setup.py` will:
 1. prompt for the VM IP, Windows user and password, and store the password in your OS keyring
    (service `flarevm`);
 2. test WinRM, and if it is not enabled, enable it on the VM (`Enable-PSRemoting`, Basic auth,
@@ -53,7 +53,7 @@ docker run -i --rm --env-file .env ghcr.io/zixuantemp/flarevm-mcp
 ```
 There is no keyring inside the container, so pass `FLAREVM_PASSWORD` explicitly.
 
-## Prepare the VM by hand (if you skipped `setup.py`)
+## Prepare the VM by hand (if you skipped `flarevm_setup.py`)
 
 Run as Administrator on the VM:
 

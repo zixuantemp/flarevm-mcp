@@ -6,7 +6,7 @@ Everything is read from the environment of the server process. Precedence:
 2. a `.env` file **next to `server.py`** — loaded at import, never overriding (1);
 3. built-in defaults (where one exists).
 
-No source edits are ever required. `setup.py` writes `.env` for you; a template is in
+No source edits are ever required. `flarevm_setup.py` writes `.env` for you; a template is in
 [`.env.example`](../.env.example). `.env` is git-ignored.
 
 ## Variables
@@ -26,7 +26,7 @@ No source edits are ever required. `setup.py` writes `.env` for you; a template 
 The password is resolved in this order: `FLAREVM_PASSWORD` env → OS keyring (service `flarevm`,
 username = `FLAREVM_USER`) → the FlareVM default `infected`.
 
-Use the keyring. `setup.py` stores it; by hand:
+Use the keyring. `flarevm_setup.py` stores it; by hand:
 
 ```bash
 python3 -c "import keyring; keyring.set_password('flarevm', 'xtemp', 'your-password')"
