@@ -21,6 +21,8 @@ harm the analyst host or steer the client. See `SECURITY.md` and `docs/HARDENING
 ### Added
 - Ported to the `mcp` 2.x low-level API (`Server(on_list_tools=…, on_call_tool=…)`; tool input is
   validated in `dispatch`; progress via `ctx.session.report_progress`). Requires `mcp>=2.1`.
+  mcp 2.x removed `mcp.server.fastmcp`, so servers still on the 1.x API (e.g. `ida-pro-mcp`) cannot
+  share a virtualenv with this one — `install.sh` creates a dedicated `~/.flarevm-mcp/venv`.
 - `flarevm_mcp/` package with a single `@tool` registry (schema + timeout + handler + trust level in one place);
   `docs/TOOLS.md` is generated from it (`python -m flarevm_mcp.docs`, checked in CI). Root `server.py` is a shim.
 - NTLM WinRM transport; optional HTTPS (`FLAREVM_WINRM_SCHEME=https`, `FLAREVM_CA_BUNDLE`).

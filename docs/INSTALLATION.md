@@ -111,3 +111,10 @@ smbclient "//$FLAREVM_HOST/KaliShare" -U xtemp -c ls
 
 Then, from the MCP client, call `check_connection` — it returns the VM hostname, OS and IP.
 Anything failing here: [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
+## Virtualenv isolation
+
+flarevm-mcp requires the `mcp` 2.x SDK. Other MCP servers written against the 1.x API
+(`mcp.server.fastmcp`, decorator-style `Server`) cannot coexist with it in one virtualenv, so keep
+flarevm-mcp in its own dedicated virtualenv (`install.sh` uses `~/.flarevm-mcp/venv`) and point the
+MCP client's `command` at that interpreter.
