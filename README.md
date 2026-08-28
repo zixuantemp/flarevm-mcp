@@ -71,3 +71,18 @@ on every push; keep `docs/TOOLS.md` in sync when adding a tool (see the note at 
 ## License
 
 [MIT](LICENSE) — © 2026 zixuantemp.
+
+## Hardening (1.2.0)
+
+The tool assumes the VM is hostile. Highlights — details in `SECURITY.md` and `docs/CONFIGURATION.md`:
+
+- NTLM (or HTTPS) WinRM; SMB password never on a command line; no default credentials.
+- Every client value is quoted before it reaches PowerShell; VM output is sanitised and wrapped in an
+  `UNTRUSTED VM OUTPUT` envelope so a sample's strings cannot pose as instructions.
+- `verify_tools` records SHA256s of the analysis binaries on a clean snapshot and blocks tools whose binary changed.
+- Staged scripts are hash-verified and deleted in the same PowerShell invocation; transfers are SHA256-verified both ways.
+- Circuit breaker + concurrency cap + output cap keep the server responsive when the VM hangs or floods.
+- `vm_health` / `vm_snapshot` report and restore VM state; detonation tools refuse a dirty VM unless acknowledged.
+- Kali-side path allow-lists for uploads and downloads.
+
+After provisioning a clean snapshot run `verify_tools(record=true)` once, then revert to that snapshot.

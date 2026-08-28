@@ -63,3 +63,34 @@ VM never intercepts the server's own WinRM/SMB traffic. That IP is determined as
 FakeNet-NG only diverts *routed* traffic. Because the VM has no gateway, `fakenet_start` adds an
 idempotent dead default route derived from the VM's own address (`x.x.x.1`) so outbound
 connections reach the diverter, and removes nothing you configured yourself.
+
+## Hardening settings (1.2.0)
+
+All optional; defaults in `.env.example`.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `FLAREVM_WINRM_SCHEME` / `FLAREVM_WINRM_PORT` | `http` / 5985 | `https` + 5986 to use a TLS listener |
+| `FLAREVM_CA_BUNDLE` | — | CA file; with HTTPS enables certificate validation (otherwise a warning is logged) |
+| `FLAREVM_MAX_CONCURRENT` | 4 | Concurrent WinRM operations |
+| `FLAREVM_MAX_OUTPUT` | 1048576 | Bytes of stdout/stderr kept per call |
+| `FLAREVM_READ_TIMEOUT` / `FLAREVM_OPERATION_TIMEOUT` | 60 / 30 | pywinrm HTTP timeouts (read must exceed operation) |
+| `FLAREVM_BREAKER_THRESHOLD` / `FLAREVM_BREAKER_COOLDOWN` | 3 / 30 | Failures before failing fast, and for how long |
+| `FLAREVM_TOOL_MANIFEST` | `./tool_manifest.json` | Where `verify_tools` reads/writes tool hashes |
+| `FLAREVM_STRICT_INTEGRITY` | on if manifest exists | Block tools whose binary hash changed |
+| `FLAREVM_ALLOWED_UPLOAD_ROOTS` | `~/Desktop:~/Downloads` | Where `upload_file` may read |
+| `FLAREVM_ALLOWED_DOWNLOAD_ROOTS` | `~/Desktop/analysis` | Where `download_file` may write |
+| `FLAREVM_VM_ID` | — | `.vmx` path (vmrun), VirtualBox name or libvirt domain for `vm_snapshot` |
+| `FLAREVM_SNAPSHOT_LIST_CMD` / `_REVERT_CMD` / `_CREATE_CMD` | — | Custom commands with `{vm}` / `{name}` placeholders |
+| `FLAREVM_CLEAN_SNAPSHOT` | `clean` | Snapshot name used by `revert`/`create` |
+| `FLAREVM_REQUIRE_CLEAN_SNAPSHOT` | 1 | Detonation guard (`ack_dirty_vm=true` overrides per call) |
+| `FLAREVM_REMOTE_TEMP` | `C:\temp` | Staging directory on the VM |
+
+WinRM over HTTPS on the guest (elevated PowerShell):
+
+```powershell
+$c = New-SelfSignedCertificate -DnsName $env:COMPUTERNAME -CertStoreLocation Cert:\LocalMachine\My
+New-Item -Path WSMan:\localhost\Listener -Transport HTTPS -Address * -CertificateThumbPrint $c.Thumbprint -Force
+netsh advfirewall firewall add rule name="WinRM-HTTPS" dir=in action=allow protocol=TCP localport=5986
+Export-Certificate -Cert $c -FilePath C:\Share\flarevm-ca.cer   # then convert to PEM on Kali for FLAREVM_CA_BUNDLE
+```

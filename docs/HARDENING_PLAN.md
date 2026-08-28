@@ -1,6 +1,6 @@
 # Hardening plan — flarevm-mcp 1.2.0 (handoff document)
 
-Status: **planning complete, implementation not started.** Written 2026-08-27 so the work can be
+Status: **implemented on branch `hardening-1.2.0` (2026-08-28).** Kept as the design record; see CHANGELOG 1.2.0 for what shipped. Written 2026-08-27 so the work can be
 resumed by anyone. Everything below was derived from reading `server.py` (3999 lines) at commit
 `0a760b1` plus the uncommitted working-tree change described in §1.
 

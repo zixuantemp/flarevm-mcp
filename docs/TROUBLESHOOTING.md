@@ -79,3 +79,17 @@ installed. The same applies to WinDbg on `WINDBG_MCP_PORT` (13338).
 The WinRM session is reset automatically. The VM state is unknown: call `list_processes`, kill
 leftovers, or revert the snapshot before retrying. Long-running tools have larger budgets; see
 `TOOL_TIMEOUTS` in `server.py`.
+
+## 1.2.0 messages
+
+| Message | Meaning / fix |
+|---------|---------------|
+| `Circuit breaker OPEN: N consecutive WinRM failures` | The VM stopped answering; calls fail fast for the cooldown. Fix the VM, then `check_connection` (resets the breaker). |
+| `INTEGRITY FAILURE: <tool> … SHA256 … expects …` | The binary on the VM differs from `tool_manifest.json`. Revert to the clean snapshot. If you upgraded the tool on purpose, re-run `verify_tools(record=true)` on the new clean snapshot. |
+| `Integrity failure: staged script was modified on the VM` | Something changed `C:\temp\<script>` between upload and execution. Treat the VM as compromised. |
+| `HASH MISMATCH after upload/download` | Transfer corrupted or tampered; retry once, then investigate the VM/share. |
+| `local_path '…' is outside the allowed roots` | Use a path under `FLAREVM_ALLOWED_UPLOAD_ROOTS` / `FLAREVM_ALLOWED_DOWNLOAD_ROOTS` or widen them in `.env`. |
+| `VM is DIRTY: … Refusing '<tool>'` | A detonation already ran. `vm_snapshot revert`, or revert by hand and `vm_snapshot mark_clean`, or pass `ack_dirty_vm=true`. |
+| `invalid file_path / filter / …` | The argument contains control characters or shell metacharacters that are never valid for that field. |
+| `No FlareVM password` | Store one with `flarevm_setup.py` (keyring) or set `FLAREVM_PASSWORD`. |
+| `[... OUTPUT TRUNCATED at N bytes …]` | Raise `FLAREVM_MAX_OUTPUT` or narrow the query (e.g. `read_file max_bytes`). |
