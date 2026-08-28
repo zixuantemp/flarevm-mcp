@@ -1,4 +1,4 @@
-"""Debuggers tools (migrated from the 1.1.0 monolith; see docs/HARDENING_PLAN.md)."""
+"""Debuggers tools (migrated from the 1.1.0 monolith)."""
 import json
 
 from ..registry import tool

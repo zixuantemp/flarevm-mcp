@@ -1,4 +1,4 @@
-"""Frida tools (migrated from the 1.1.0 monolith; see docs/HARDENING_PLAN.md)."""
+"""Frida tools (migrated from the 1.1.0 monolith)."""
 
 from ..registry import tool
 from ..winrm_client import run_ps_async

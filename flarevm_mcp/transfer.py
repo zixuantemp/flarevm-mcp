@@ -1,6 +1,6 @@
 """File transfer and script staging over SMB.
 
-Integrity design (docs/HARDENING_PLAN.md §4.2):
+Integrity design (see SECURITY.md):
   * every staged file gets a UUID name — concurrent calls cannot collide;
   * a staged script is hash-verified, executed and deleted inside ONE
     PowerShell invocation, shrinking the tamper window to a single process;

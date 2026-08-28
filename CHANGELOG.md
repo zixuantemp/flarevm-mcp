@@ -4,7 +4,7 @@
 
 Threat model: a sample running on FlareVM must not be able to compromise the
 availability or integrity of this tool, and VM-produced data must never be able to
-harm the analyst host or steer the client. See `SECURITY.md` and `docs/HARDENING_PLAN.md`.
+harm the analyst host or steer the client. See `SECURITY.md`.
 
 ### Breaking
 - `setup.py` is now `flarevm_setup.py` (setuptools executed the installer during `pip install -e .`).

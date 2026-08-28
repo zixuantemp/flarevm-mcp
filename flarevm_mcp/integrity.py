@@ -1,4 +1,4 @@
-"""Integrity and availability primitives (docs/HARDENING_PLAN.md §4.2–4.3).
+"""Integrity and availability primitives (see SECURITY.md).
 
 * Tool-binary manifest: SHA256 of every analysis tool on the VM, recorded
   against a clean snapshot and checked before a tool is executed. A hostile

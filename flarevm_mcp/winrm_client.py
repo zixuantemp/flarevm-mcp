@@ -1,6 +1,6 @@
 """WinRM execution layer.
 
-Availability design (see docs/HARDENING_PLAN.md §4.3):
+Availability design (see SECURITY.md):
   * one pywinrm Session per worker thread (requests.Session is not thread-safe);
   * an asyncio semaphore caps concurrent WinRM operations so a burst of tool
     calls cannot exhaust the executor or swamp the VM;
