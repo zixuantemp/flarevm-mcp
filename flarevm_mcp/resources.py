@@ -1,7 +1,7 @@
 """MCP resources: tool inventory, FakeNet config, docs, connection/integrity status."""
 import json
 
-from mcp.types import Resource
+from mcp.types import ListResourcesResult, ReadResourceResult, Resource, TextResourceContents
 
 from . import config
 from ._resource_data import CHEATSHEET_TEXT, TOOLS_REFERENCE_TEXT, YARA_INDEX_TEXT
@@ -21,11 +21,19 @@ RESOURCE_DEFS = [
 
 
 def list_resources():
-    return [Resource(uri=u, name=n, description=n, mimeType=m) for (u, n, m) in RESOURCE_DEFS]
+    return ListResourcesResult(resources=[Resource(uri=u, name=n, description=n, mime_type=m)
+                                          for (u, n, m) in RESOURCE_DEFS])
 
 
 async def read_resource(uri):
+    """Return a ReadResourceResult for *uri*."""
     uri_s = str(uri)
+    mime = next((m for (u, _, m) in RESOURCE_DEFS if u == uri_s), "text/plain")
+    text = await _resource_text(uri_s)
+    return ReadResourceResult(contents=[TextResourceContents(uri=uri_s, mime_type=mime, text=text)])
+
+
+async def _resource_text(uri_s):
     if uri_s == "flarevm://docs/cheatsheet":
         return CHEATSHEET_TEXT
     if uri_s == "flarevm://docs/yara-rules":

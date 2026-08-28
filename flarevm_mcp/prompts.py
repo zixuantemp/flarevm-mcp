@@ -1,14 +1,15 @@
 """MCP prompts (workflow recipes)."""
-from mcp.types import GetPromptResult, Prompt, PromptArgument, PromptMessage, TextContent
+from mcp.types import GetPromptResult, ListPromptsResult, Prompt, PromptArgument, PromptMessage, TextContent
 
 from ._prompt_data import PROMPT_DEFS, _prompt_body
 
 
 def list_prompts():
-    return [Prompt(name=p["name"], description=p["description"],
-                   arguments=[PromptArgument(name=a["name"], description=a["description"],
-                                             required=a.get("required", False)) for a in p["arguments"]])
-            for p in PROMPT_DEFS]
+    return ListPromptsResult(prompts=[
+        Prompt(name=p["name"], description=p["description"],
+               arguments=[PromptArgument(name=a["name"], description=a["description"],
+                                         required=a.get("required", False)) for a in p["arguments"]])
+        for p in PROMPT_DEFS])
 
 
 def get_prompt(name, arguments=None):

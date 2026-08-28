@@ -19,9 +19,8 @@ jobs:
           import flarevm_mcp.server as s
           from flarevm_mcp.registry import REGISTRY
           assert len(REGISTRY) >= 55, len(REGISTRY)
-          names = {t.__name__ for t in s.app.request_handlers}
-          for req in ("ListToolsRequest", "CallToolRequest", "ListPromptsRequest", "ListResourcesRequest"):
-              assert req in names, req
+          for method in ("tools/list", "tools/call", "prompts/list", "prompts/get", "resources/list", "resources/read"):
+              assert s.app.get_request_handler(method) is not None, method
           print("OK", len(REGISTRY), "tools")
           PY
       - name: Configuration contract

@@ -4,19 +4,22 @@ derives the advertised list, ``dispatch`` routes calls, ``docs`` generation
 reads the same registry, so nothing can drift.
 
 Handler contract:
-  * receives ``args`` (validated against ``schema`` by the MCP server);
+  * receives ``args`` (validated against ``schema`` in ``dispatch``);
   * returns ``str`` (text result) or ``dict`` (structured JSON result);
   * raises ``ToolError`` for a user-facing failure. Any other exception is
     logged with its traceback and surfaced as a concise error. Both paths
-    become ``isError=True`` on the wire.
+    become ``is_error=True`` on the wire.
 """
 import asyncio
+import contextvars
+import json
 import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict
 
-from mcp.types import TextContent, Tool
+import jsonschema
+from mcp.types import CallToolResult, TextContent, Tool
 
 from . import config
 from .psquote import sanitize_output, untrusted_envelope
@@ -46,12 +49,8 @@ class ToolSpec:
 
 
 REGISTRY: Dict[str, ToolSpec] = {}
-_app_ref: list = [None]
-
-
-def set_app(app):
-    """Give the registry access to the low-level Server for progress notifications."""
-    _app_ref[0] = app
+# The mcp 2.x ServerRequestContext of the call being dispatched (for progress).
+current_ctx: contextvars.ContextVar = contextvars.ContextVar("flarevm_request_ctx", default=None)
 
 
 def tool(name, *, description, schema=None, timeout=config.DEFAULT_TOOL_TIMEOUT,
@@ -73,23 +72,19 @@ def specs():
 
 
 def mcp_tools():
-    return [Tool(name=s.name, description=s.description, inputSchema=s.schema) for s in specs()]
+    return [Tool(name=s.name, description=s.description, input_schema=s.schema) for s in specs()]
 
 
 async def progress(message, current=None, total=None):
-    """Send an MCP progress notification if the client asked for one; never raises."""
-    app = _app_ref[0]
-    if app is None:
+    """Send an MCP progress notification for the current request; a no-op when the
+    client did not ask for progress or outside a request. Never raises."""
+    ctx = current_ctx.get()
+    if ctx is None:
         return
     try:
-        ctx = app.request_context
-        token = ctx.meta.progressToken if ctx.meta else None
-        if token is None:
-            return
-        await ctx.session.send_progress_notification(
-            token, float(current if current is not None else 0),
-            float(total) if total is not None else None, message)
-    except Exception:  # LookupError outside a request, or a closed session
+        await ctx.session.report_progress(float(current if current is not None else 0),
+                                          float(total) if total is not None else None, message)
+    except Exception:  # closed session etc.
         LOG.debug("progress notification skipped", exc_info=True)
 
 
@@ -110,11 +105,20 @@ def _finalize(spec, result):
     return [TextContent(type="text", text=str(result))]
 
 
+def validate_arguments(spec, args):
+    """Validate client arguments against the tool's JSON schema (mcp 2.x no longer does it)."""
+    try:
+        jsonschema.validate(instance=args, schema=spec.schema)
+    except jsonschema.ValidationError as exc:
+        raise ToolError("Input validation error: {}".format(exc.message)) from None
+
+
 async def dispatch(name, arguments):
     spec = REGISTRY.get(name)
     if spec is None:
         raise ToolError("Unknown tool: {}".format(name))
     args = arguments or {}
+    validate_arguments(spec, args)
     t0 = time.monotonic()
     status = "ok"
     try:
@@ -142,3 +146,19 @@ async def dispatch(name, arguments):
     finally:
         LOG.info("tool=%s status=%s duration=%.1fs", name, status, time.monotonic() - t0)
     return _finalize(spec, result)
+
+
+async def call_tool_result(name, arguments, ctx=None):
+    """dispatch() adapted to the mcp 2.x ``on_call_tool`` contract: always returns a
+    CallToolResult, with ``is_error`` set instead of raising."""
+    token = current_ctx.set(ctx)
+    try:
+        result = await dispatch(name, arguments)
+    except ToolError as exc:
+        return CallToolResult(content=[TextContent(type="text", text=str(exc))], is_error=True)
+    finally:
+        current_ctx.reset(token)
+    if isinstance(result, dict):
+        return CallToolResult(content=[TextContent(type="text", text=json.dumps(result, indent=2))],
+                              structured_content=result)
+    return CallToolResult(content=list(result))

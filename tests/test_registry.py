@@ -85,3 +85,41 @@ def test_dispatch_timeout(fresh, run):
 
 def test_progress_is_noop_without_app(run):
     run(r.progress("hi", 1, 2))  # must not raise
+
+
+def test_validation_and_call_tool_result(fresh, run):
+    @fresh.tool("v", description="d", schema={"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]})
+    async def v(args):
+        return "n={}".format(args["n"])
+    with pytest.raises(fresh.ToolError, match="Input validation error"):
+        run(fresh.dispatch("v", {"n": "x"}))
+    with pytest.raises(fresh.ToolError, match="Input validation error"):
+        run(fresh.dispatch("v", {}))
+    ok = run(fresh.call_tool_result("v", {"n": 3}))
+    assert not ok.is_error and "n=3" in ok.content[0].text
+    bad = run(fresh.call_tool_result("v", {"n": "x"}))
+    assert bad.is_error and "Input validation error" in bad.content[0].text
+
+    @fresh.tool("j", description="d", untrusted=False)
+    async def j(args):
+        return {"a": 1}
+    res = run(fresh.call_tool_result("j", {}))
+    assert res.structured_content == {"a": 1} and '"a": 1' in res.content[0].text
+
+
+def test_progress_reports_through_ctx(fresh, run):
+    calls = []
+
+    class Sess:
+        async def report_progress(self, progress, total=None, message=None):
+            calls.append((progress, total, message))
+
+    class Ctx:
+        session = Sess()
+
+    @fresh.tool("p", description="d")
+    async def p(args):
+        await fresh.progress("step", 1, 2)
+        return "ok"
+    run(fresh.call_tool_result("p", {}, Ctx()))
+    assert calls == [(1.0, 2.0, "step")]
