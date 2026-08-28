@@ -9,7 +9,7 @@
   [CONFIGURATION.md → Lab network](CONFIGURATION.md#lab-network))
 
 **FlareVM** (Windows 10/11 with [FlareVM](https://github.com/mandiant/flare-vm) installed)
-- WinRM enabled with Basic auth over HTTP (5985) — `flarevm_setup.py` does this for you
+- WinRM enabled (NTLM over HTTP 5985 is the default; HTTPS 5986 optional) — `flarevm_setup.py` does this for you
 - SMB share `KaliShare` → `C:\Share` (optional; `flarevm_setup.py` creates it)
 - The analysis binaries under `C:\Tools\…` listed in
   [../resources/tools-reference.md](../resources/tools-reference.md)
@@ -32,8 +32,8 @@ python3 flarevm_setup.py            # --host, --user, --share, --skip-provision 
 `flarevm_setup.py` will:
 1. prompt for the VM IP, Windows user and password, and store the password in your OS keyring
    (service `flarevm`);
-2. test WinRM, and if it is not enabled, enable it on the VM (`Enable-PSRemoting`, Basic auth,
-   firewall rule for 5985);
+2. test WinRM (NTLM), and if it is not enabled, print the `Enable-PSRemoting` + firewall steps to
+   run on the VM;
 3. create and verify the SMB share;
 4. write `.env` next to `server.py` and print a ready-to-paste MCP client snippet.
 
@@ -58,12 +58,11 @@ There is no keyring inside the container, so pass `FLAREVM_PASSWORD` explicitly.
 Run as Administrator on the VM:
 
 ```powershell
-# WinRM over HTTP with Basic auth (plaintext — isolated network only)
+# WinRM over HTTP with NTLM (enabled by default; Basic auth / AllowUnencrypted are NOT needed)
 Enable-PSRemoting -Force
-winrm set winrm/config/client/auth '@{Basic="true"}'
-winrm set winrm/config/service/auth '@{Basic="true"}'
-winrm set winrm/config/service '@{AllowUnencrypted="true"}'
+Set-Item WSMan:\localhost\Service\Auth\Negotiate -Value $true
 netsh advfirewall firewall add rule name="WinRM-HTTP" dir=in action=allow protocol=TCP localport=5985
+# Optional, recommended: HTTPS listener on 5986 — see CONFIGURATION.md → Hardening settings
 
 # SMB share for large transfers
 New-Item -Path "C:\Share" -ItemType Directory -Force

@@ -48,7 +48,9 @@ analyst host  eth1  192.168.167.50/24  ──host-only VMnet──  FlareVM  192
   drift and turn into "VM busy" timeouts.
 - Keep the segment's subnet distinct from any real LAN the analyst host is bridged to —
   overlapping subnets silently misroute WinRM.
-- WinRM is plaintext HTTP (5985) — acceptable only because of the isolation. Never expose it.
+- WinRM is NTLM over HTTP (5985) by default — NTLM encrypts the message body, but the isolation is
+  still what keeps the channel private. Never expose 5985/5986 beyond the lab segment; use
+  `FLAREVM_WINRM_SCHEME=https` + `FLAREVM_CA_BUNDLE` if you want TLS as well.
 
 ## FakeNet host protection
 

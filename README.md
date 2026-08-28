@@ -59,9 +59,12 @@ All settings: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 ## Security in one paragraph
 
 The analyst host is trusted and never executes samples; the VM is hostile and assumed compromised
-after any detonation — snapshot before, revert after. WinRM runs in plaintext **only** because the
-VM sits on an isolated host-only network; never expose port 5985 beyond it. FakeNet's
-`HostBlackList` shields the analyst host's own control traffic. Full model: [SECURITY.md](SECURITY.md).
+after any detonation — snapshot before, revert after. WinRM uses NTLM (message-level encryption,
+no Basic auth) over HTTP, or HTTPS with certificate validation if you configure a listener; either
+way the VM sits on an isolated host-only network and port 5985/5986 must never be exposed beyond
+it. FakeNet's `HostBlackList` shields the analyst host's own control traffic. Every value sent to
+the VM is quoted, every result is hash-checked or wrapped as untrusted, and tampered tool binaries
+are refused. Full model: [SECURITY.md](SECURITY.md).
 
 ## Contributing
 

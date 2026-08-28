@@ -22,9 +22,9 @@ curl -s -o /dev/null -w '%{http_code}\n' "http://$FLAREVM_HOST:5985/wsman"   # 4
 - No ping → the VM is off, or on a different subnet than the analyst interface (`ip route get
   $FLAREVM_HOST` shows which interface would be used). Re-address one side; see
   [CONFIGURATION.md → Lab network](CONFIGURATION.md#lab-network).
-- Ping but no 405 → WinRM is not listening. On the VM: `Enable-PSRemoting -Force` and the
-  Basic/AllowUnencrypted settings in [INSTALLATION.md](INSTALLATION.md#prepare-the-vm-by-hand-if-you-skipped-setuppy),
-  or re-run `python3 flarevm_setup.py`.
+- Ping but no 405 → WinRM is not listening. On the VM: `Enable-PSRemoting -Force` plus the firewall
+  rule in [INSTALLATION.md](INSTALLATION.md#prepare-the-vm-by-hand-if-you-skipped-flarevm_setuppy),
+  or re-run `python3 flarevm_setup.py`. NTLM is on by default; Basic auth is not required.
 
 ## 401 / "the specified credentials were rejected"
 
