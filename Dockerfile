@@ -6,4 +6,5 @@ WORKDIR /app
 COPY pyproject.toml requirements.txt ./
 RUN pip install --no-cache-dir -e .
 COPY server.py ./
+COPY flarevm_mcp ./flarevm_mcp
 ENTRYPOINT ["python", "server.py"]

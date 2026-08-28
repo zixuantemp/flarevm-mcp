@@ -5,64 +5,52 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python: ["3.10", "3.11", "3.12"]
+        python: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: pip install -e .
-      - run: python -c "import server; print('Server imports OK')"
-      - run: python -m py_compile server.py
-      - name: MCP server import + tool registration
+      - run: pip install -e ".[dev]"
+      - name: Import + registry
         run: |
-          python <<'PY'
-          # The mcp-decorated function may not be directly callable; check the
-          # server registration handlers instead.
-          import server
-          handlers = server.app.request_handlers
-          assert handlers, "No request handlers registered"
-          # Confirm tools/list, prompts/list, resources/list handlers present
-          handler_names = {t.__name__ for t in handlers.keys()}
-          for required in ("ListToolsRequest", "ListPromptsRequest", "ListResourcesRequest"):
-              assert required in handler_names, f"Missing {required} (have: {handler_names})"
-          print(f"OK — {len(handlers)} MCP handlers registered:", sorted(handler_names))
+          python - <<'PY'
+          import os; os.environ.pop("FLAREVM_HOST", None)
+          import flarevm_mcp.server as s
+          from flarevm_mcp.registry import REGISTRY
+          assert len(REGISTRY) >= 55, len(REGISTRY)
+          names = {t.__name__ for t in s.app.request_handlers}
+          for req in ("ListToolsRequest", "CallToolRequest", "ListPromptsRequest", "ListResourcesRequest"):
+              assert req in names, req
+          print("OK", len(REGISTRY), "tools")
           PY
       - name: Configuration contract
         run: |
-          python <<'PY'
-          import os, subprocess, sys, tempfile
-          # 1. Importable with no configuration at all (tooling, tests) …
+          python - <<'PY'
+          import os, re, subprocess, sys, tempfile
           os.environ.pop("FLAREVM_HOST", None)
-          import server
-          assert server.FLAREVM_HOST is None
-          # 2. … but refuses to *serve* without a VM address, loudly.
-          r = subprocess.run([sys.executable, "-c", "import server; server._require_host()"],
+          from flarevm_mcp import config
+          assert config.FLAREVM_HOST is None
+          r = subprocess.run([sys.executable, "-c", "from flarevm_mcp import config; config.require_host()"],
                              capture_output=True, text=True, env={k: v for k, v in os.environ.items() if k != "FLAREVM_HOST"})
           assert r.returncode != 0 and "FLAREVM_HOST" in (r.stdout + r.stderr), r
-          # 3. .env is honoured and never overrides the process environment.
+          r = subprocess.run([sys.executable, "-c", "from flarevm_mcp import config; config.get_password()"],
+                             capture_output=True, text=True, env={k: v for k, v in os.environ.items() if k != "FLAREVM_PASSWORD"})
+          assert r.returncode != 0 and "password" in (r.stdout + r.stderr).lower(), "must refuse without a password"
           with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
-              f.write("FLAREVM_HOST=10.0.0.9\nFLAREVM_SMB_SHARE=Alt\n# comment\n"); path = f.name
+              f.write("FLAREVM_HOST=10.0.0.9\nFLAREVM_SMB_SHARE=Alt\n# c\n"); path = f.name
           os.environ["FLAREVM_SMB_SHARE"] = "FromEnv"
-          server._load_dotenv(path)
+          config._load_dotenv(path)
           assert os.environ["FLAREVM_HOST"] == "10.0.0.9" and os.environ["FLAREVM_SMB_SHARE"] == "FromEnv"
-          # 4. No hardcoded lab addresses anywhere in the server.
-          import re
-          src = open("server.py").read()
-          hits = [m for m in re.findall(r"\b(?:192\.168|10\.\d+|172\.(?:1[6-9]|2\d|3[01]))\.\d+\.\d+\b", src)]
-          assert not hits, f"private-range IP literals in server.py: {hits}"
+          import glob
+          for fn in glob.glob("flarevm_mcp/**/*.py", recursive=True):
+              hits = re.findall(r"\b(?:192\.168|10\.\d+|172\.(?:1[6-9]|2\d|3[01]))\.\d+\.\d+\b", open(fn).read())
+              assert not hits, (fn, hits)
           print("configuration contract OK")
           PY
-      - name: docs/TOOLS.md matches registered tools
-        run: |
-          python <<'PY'
-          import re
-          src = open("server.py").read(); doc = open("docs/TOOLS.md").read()
-          in_src = set(re.findall(r'Tool\(\s*name="([a-z0-9_]+)"', src))
-          in_doc = set(re.findall(r"^\| `([a-z0-9_]+)` \|", doc, re.M))
-          assert in_src == in_doc, f"undocumented: {sorted(in_src - in_doc)}  stale: {sorted(in_doc - in_src)}"
-          print(f"docs/TOOLS.md in sync ({len(in_src)} tools)")
-          PY
+      - run: pytest -q
+      - name: docs/TOOLS.md in sync with the registry
+        run: python -m flarevm_mcp.docs --check
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -71,9 +59,6 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install ruff bandit
-      # Use ruff config from pyproject.toml — selects E,F,B and ignores E501
-      # (most "long lines" are PowerShell heredocs that cannot be wrapped)
-      - run: ruff check server.py
-      # Bandit: skip B404 (subprocess), B603 (subprocess no-shell), B607 (partial-path)
-      # — these are inherent to a remote-execution MCP server.
-      - run: bandit -r server.py -ll --skip B404,B603,B607
+      - run: ruff check flarevm_mcp server.py tests
+      # B404/B603/B607: subprocess use is inherent to a remote-execution bridge.
+      - run: bandit -r flarevm_mcp server.py -ll --skip B404,B603,B607
