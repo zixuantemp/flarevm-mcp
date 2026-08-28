@@ -46,7 +46,7 @@ def fake_vm(monkeypatch):
     winrm_client.breaker.reset()
     monkeypatch.setattr(config, "FLAREVM_HOST", "10.0.0.9")
     monkeypatch.setattr(config, "get_password", lambda: "test-password")
-    monkeypatch.setattr(config, "STRICT_INTEGRITY", False)
+    monkeypatch.setattr(config, "strict_integrity", lambda: False)
     return vm
 
 

@@ -19,7 +19,7 @@ import tempfile
 import uuid
 
 from . import config
-from .psquote import ps_quote
+from .psquote import first_error, ps_quote
 from .registry import ToolError
 from .winrm_client import run_ps_async
 
@@ -159,7 +159,7 @@ async def upload_file(local_path, remote_path):
     ).format(dst=ps_quote(remote_path), src=ps_quote(_share_local(name)))
     out, err, code = await run_ps_async(ps, timeout=120)
     if code != 0:
-        raise ToolError("Move from SMB share failed: {} {}".format(err, out))
+        raise ToolError("Move from SMB share failed: {}".format(first_error(err, out)))
     remote_hash = out.strip().splitlines()[-1].strip() if out.strip() else ""
     if remote_hash != local_hash:
         raise ToolError("HASH MISMATCH after upload\nPath: {}\nLocal:  {}\nRemote: {}".format(
@@ -181,7 +181,7 @@ async def download_file(remote_path, local_path):
     ).format(src=ps_quote(remote_path), staged=ps_quote(_share_local(name)))
     out, err, code = await run_ps_async(ps, timeout=120)
     if code != 0:
-        raise ToolError("Remote file error: {} {}".format(err, out))
+        raise ToolError("Remote file error: {}".format(first_error(err, out)))
     try:
         size_s, remote_hash = out.strip().splitlines()[-1].split()
         size = int(size_s)

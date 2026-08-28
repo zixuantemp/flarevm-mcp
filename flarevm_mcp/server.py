@@ -52,5 +52,5 @@ async def main():
 def main_sync():
     config.require_host()
     config.LOG.info("flarevm-mcp %s starting: endpoint=%s strict_integrity=%s max_concurrent=%s",
-                    __version__, config.winrm_endpoint(), config.STRICT_INTEGRITY, config.MAX_CONCURRENT)
+                    __version__, config.winrm_endpoint(), config.strict_integrity(), config.MAX_CONCURRENT)
     asyncio.run(main())

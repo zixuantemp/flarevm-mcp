@@ -74,6 +74,28 @@ def cap_output(text, limit):
     return text
 
 
+def first_error(stderr, stdout="", limit=300):
+    """Extract the human message from PowerShell error output.
+
+    Inline scripts report ``<whole script> : message`` for Write-Error and
+    ``Cmdlet : message`` for cmdlet errors, both followed by ``At line:`` /
+    ``+ CategoryInfo`` context. A stdout line starting with ``ERROR:`` wins.
+    """
+    for line in (stdout or "").splitlines():
+        if line.strip().startswith("ERROR:"):
+            return line.strip()[6:].strip()[:limit]
+    head = []
+    for line in (stderr or "").splitlines():
+        if line.startswith("At line:") or line.lstrip().startswith("+ "):
+            break
+        head.append(line)
+    text = "\n".join(head).strip()
+    if " : " in text:
+        text = text.rsplit(" : ", 1)[1]
+    text = " ".join(text.split()) or " ".join((stderr or stdout or "unknown error").split())
+    return text[:limit]
+
+
 def untrusted_envelope(text):
     """Wrap VM-produced text so the client can tell evidence from instructions."""
     text = text if text is not None else ""

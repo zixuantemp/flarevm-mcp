@@ -37,13 +37,13 @@ async def _handle_verify_tools(args):
     report = compare(manifest.get("tools", {}), observed)
     bad = [k for k, v in report.items() if v["status"] == "MISMATCH"]
     summary = {"status": "TAMPERED" if bad else "ok", "mismatched": bad,
-               "strict": config.STRICT_INTEGRITY, "manifest_generated": manifest.get("generated"),
+               "strict": config.strict_integrity(), "manifest_generated": manifest.get("generated"),
                "tools": report}
     if args.get("format") == "json":
         return summary
     lines = ["=== Tool integrity: {} ===".format(summary["status"]),
              "Manifest: {} (generated {})".format(config.TOOL_MANIFEST, manifest.get("generated")),
-             "Strict mode: {}".format(config.STRICT_INTEGRITY), ""]
+             "Strict mode: {}".format(config.strict_integrity()), ""]
     for k in sorted(report):
         v = report[k]
         lines.append("{:<9} {:<15} {}".format(v["status"], k, v["path"]))
@@ -98,7 +98,7 @@ $procs = (Get-Process | Measure-Object).Count
     report = {"breaker": breaker.snapshot(), "vm_state": vm_state.snapshot(),
               "guest": guest, "guest_error": guest_error,
               "limits": {"max_concurrent": config.MAX_CONCURRENT, "max_output": config.MAX_OUTPUT,
-                         "strict_integrity": config.STRICT_INTEGRITY}}
+                         "strict_integrity": config.strict_integrity()}}
     warnings = []
     if guest.get("disk_free_mb") is not None and guest["disk_free_mb"] < 2048:
         warnings.append("low disk: {} MB free".format(guest["disk_free_mb"]))

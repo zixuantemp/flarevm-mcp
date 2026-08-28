@@ -75,6 +75,6 @@ async def read_resource(uri):
     if uri_s == "flarevm://status/integrity":
         m = load_manifest()
         return json.dumps({"manifest": config.TOOL_MANIFEST, "present": bool(m),
-                           "generated": (m or {}).get("generated"), "strict": config.STRICT_INTEGRITY,
+                           "generated": (m or {}).get("generated"), "strict": config.strict_integrity(),
                            "tools_listed": sorted((m or {}).get("tools", {}).keys())}, indent=2)
     return "Unknown resource: " + uri_s

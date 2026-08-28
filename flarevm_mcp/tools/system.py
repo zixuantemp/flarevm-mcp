@@ -5,7 +5,7 @@ import logging
 
 from .. import config
 from ..guest import launch_gui_app
-from ..psquote import ps_ident, ps_int, ps_path, ps_quote, win_arg
+from ..psquote import first_error, ps_ident, ps_int, ps_path, ps_quote, win_arg
 from ..registry import ToolError, tool
 from ..transfer import download_file, upload_file
 from ..winrm_client import breaker, run_ps_async
@@ -99,7 +99,7 @@ if ($size -gt {max_bytes}) {{
 """.format(path=path, enc=ps_quote(encoding), max_bytes=max_bytes)
     stdout, stderr, code = await run_ps_async(ps, timeout=60)
     if code != 0:
-        raise ToolError("{} {}".format(stderr, stdout))
+        raise ToolError(first_error(stderr, stdout))
     return stdout
 
 
@@ -164,7 +164,7 @@ if (-not (Test-Path -LiteralPath $path)) {{ Write-Error "File not found: $path";
 """.format(path=path)
     stdout, stderr, code = await run_ps_async(ps, timeout=60)
     if code != 0 or not stdout.strip():
-        raise ToolError("{} {}".format(stderr, stdout))
+        raise ToolError(first_error(stderr, stdout))
     info = json.loads(stdout.strip().splitlines()[-1])
     if args.get("format") == "json":
         return info
@@ -192,13 +192,13 @@ async def _handle_list_processes(args):
         ps = "@({} | {}) | ConvertTo-Json -Compress".format(source, select)
         stdout, stderr, code = await run_ps_async(ps, timeout=30)
         if code != 0:
-            raise ToolError("{} {}".format(stderr, stdout))
+            raise ToolError(first_error(stderr, stdout))
         data = json.loads(stdout) if stdout.strip() else []
         return {"processes": data if isinstance(data, list) else [data]}
     ps = "{} | Format-Table Id, ProcessName, CPU, WorkingSet64, Path -AutoSize | Out-String -Width 200".format(source)
     stdout, stderr, code = await run_ps_async(ps, timeout=30)
     if code != 0:
-        raise ToolError("{} {}".format(stderr, stdout))
+        raise ToolError(first_error(stderr, stdout))
     return "=== Running Processes ===\n" + stdout
 
 

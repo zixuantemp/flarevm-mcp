@@ -96,9 +96,15 @@ ALLOWED_DOWNLOAD_ROOTS = _env_paths("FLAREVM_ALLOWED_DOWNLOAD_ROOTS",
 TOOL_MANIFEST = os.path.expanduser(
     os.environ.get("FLAREVM_TOOL_MANIFEST", os.path.join(REPO_ROOT, "tool_manifest.json")))
 _strict_raw = os.environ.get("FLAREVM_STRICT_INTEGRITY")
-# Default: strict once a manifest exists; explicit env always wins.
-STRICT_INTEGRITY = (_strict_raw.strip().lower() in ("1", "true", "yes", "on")
-                    if _strict_raw else os.path.isfile(TOOL_MANIFEST))
+STRICT_INTEGRITY = None if not _strict_raw else _strict_raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def strict_integrity():
+    """Explicit FLAREVM_STRICT_INTEGRITY wins; otherwise strict as soon as a manifest exists
+    (evaluated per call, so verify_tools(record=true) switches it on immediately)."""
+    if STRICT_INTEGRITY is not None:
+        return STRICT_INTEGRITY
+    return os.path.isfile(TOOL_MANIFEST)
 
 # ── Snapshot / hypervisor hooks ──────────────────────────────────────────────
 VM_ID = os.environ.get("FLAREVM_VM_ID") or None

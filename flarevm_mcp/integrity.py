@@ -97,7 +97,7 @@ async def hash_remote_files(paths):
 
 async def verify_binary(tool_key, path):
     """Raise ToolError if STRICT_INTEGRITY is on and the binary's hash differs from the manifest."""
-    if not config.STRICT_INTEGRITY:
+    if not config.strict_integrity():
         return
     exp = expected_hash(tool_key)
     if not exp:

@@ -20,7 +20,7 @@ def test_verify_binary_blocks_on_mismatch(fake_vm, run, monkeypatch, tmp_path):
     mf = tmp_path / "m.json"
     mf.write_text(json.dumps({"tools": {"die": {"path": "C:\\d", "sha256": "aa"}}}))
     monkeypatch.setattr(config, "TOOL_MANIFEST", str(mf))
-    monkeypatch.setattr(config, "STRICT_INTEGRITY", True)
+    monkeypatch.setattr(config, "strict_integrity", lambda: True)
     it._verified.clear()
     fake_vm.respond("die|bb")
     with pytest.raises(ToolError, match="INTEGRITY FAILURE"):
@@ -36,7 +36,7 @@ def test_verify_binary_blocks_on_mismatch(fake_vm, run, monkeypatch, tmp_path):
 
 
 def test_verify_binary_noop_when_not_strict(fake_vm, run, monkeypatch):
-    monkeypatch.setattr(config, "STRICT_INTEGRITY", False)
+    monkeypatch.setattr(config, "strict_integrity", lambda: False)
     run(it.verify_binary("die", "C:\\d"))
     assert fake_vm.calls == []
 
