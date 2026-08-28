@@ -9,3 +9,6 @@ dist/
 venv/
 config.json
 *.log
+# per-lab tool hash manifest (record with verify_tools record=true)
+tool_manifest.json
+.pytest_cache/

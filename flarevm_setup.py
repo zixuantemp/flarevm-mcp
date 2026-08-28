@@ -5,7 +5,7 @@ FlareVM MCP Setup — self-configuring, idempotent installer.
 Run from the repo root after `git clone` and after the user has installed
 FlareVM and enabled WinRM on the Windows VM:
 
-    python3 setup.py [--host IP] [--user USERNAME] [--share SHARENAME]
+    python3 flarevm_setup.py [--host IP] [--user USERNAME] [--share SHARENAME]
 
 Steps performed:
   1. Prompt for FlareVM IP, username, password (or read from args/env)
@@ -33,7 +33,7 @@ import textwrap
 import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_HOST = "192.168.100.10"
+DEFAULT_HOST = None  # no default on purpose — the lab subnet is site-specific
 DEFAULT_USER = "xtemp"
 DEFAULT_SHARE = "KaliShare"
 KEYRING_SERVICE = "flarevm"
@@ -125,10 +125,10 @@ def check_winrm(host, user, password):
           To enable WinRM on the Windows VM, run this in an elevated PowerShell:
 
               Enable-PSRemoting -Force
-              winrm set winrm/config/client/auth '@{{Basic="true"}}'
-              winrm set winrm/config/service/auth '@{{Basic="true"}}'
-              Set-Item WSMan:\\localhost\\Service\\AllowUnencrypted -Value $true
+              # NTLM is enabled by default; Basic auth / AllowUnencrypted are NOT needed.
+              Set-Item WSMan:\\localhost\\Service\\Auth\\Negotiate -Value $true
               netsh advfirewall firewall add rule name="WinRM-HTTP" dir=in action=allow protocol=TCP localport=5985
+              # Optional (recommended): HTTPS listener on 5986 — see docs/CONFIGURATION.md
         """).rstrip())
         return None
     _ok(f"WinRM OK: {out}")
@@ -471,7 +471,9 @@ def main():
     user  = args.user  or os.environ.get("FLAREVM_USER", DEFAULT_USER)
     share = args.share or os.environ.get("FLAREVM_SMB_SHARE", DEFAULT_SHARE)
 
-    host  = input(f"  FlareVM IP [{host}]: ").strip() or host
+    host  = input(f"  FlareVM IP [{host or 'required'}]: ").strip() or host
+    while not host:
+        host = input("  FlareVM IP (required): ").strip()
     user  = input(f"  Windows username [{user}]: ").strip() or user
     share = input(f"  SMB share name [{share}]: ").strip() or share
 
@@ -494,7 +496,7 @@ def main():
     if session is None:
         _die(
             "Cannot reach FlareVM over WinRM.",
-            "Enable WinRM on the VM (see instructions above), then re-run setup.py.",
+            "Enable WinRM on the VM (see instructions above), then re-run flarevm_setup.py.",
         )
 
     # ── 3. Guest provisioning ─────────────────────────────────────────────────

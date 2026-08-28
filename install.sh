@@ -22,7 +22,8 @@ command -v smbclient >/dev/null || {
 # 4. Prompt for FlareVM credentials -> keyring
 echo
 echo "Enter FlareVM credentials (stored in system keyring):"
-read -p "  FlareVM IP [192.168.100.10]: " IP; IP=${IP:-192.168.100.10}
+IP="${FLAREVM_HOST:-}"
+while [ -z "$IP" ]; do read -p "  FlareVM IP (required): " IP; done
 read -p "  FlareVM user [xtemp]: " USER_; USER_=${USER_:-xtemp}
 read -sp "  FlareVM password: " PW; echo
 "$VENV/bin/python" -c "import keyring; keyring.set_password('flarevm', '$USER_', '$PW')"
@@ -32,7 +33,7 @@ cat <<EOF
 
 [*] Installation complete.
 
-Add this to your MCP client config (~/.claude/.mcp.json or claude_desktop_config.json):
+Add this to your MCP client config (~/.claude.json, a project .mcp.json, or claude_desktop_config.json):
 
 {
   "mcpServers": {

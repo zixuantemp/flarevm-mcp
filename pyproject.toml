@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flarevm-mcp"
-version = "1.0.0"
+version = "1.2.0"
 description = "MCP server for FlareVM malware analysis"
 readme = "README.md"
 license = {text = "MIT"}
@@ -19,14 +19,17 @@ classifiers = [
     "Topic :: Security",
 ]
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=2.1,<3",
     "pywinrm>=0.4.3",
     "keyring>=24.0.0",
     "requests>=2.31.0",
 ]
 
 [project.scripts]
-flarevm-mcp = "server:main_sync"
+flarevm-mcp = "flarevm_mcp.server:main_sync"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff", "bandit"]
 
 [project.urls]
 Homepage = "https://github.com/zixuantemp/flarevm-mcp"
@@ -34,6 +37,7 @@ Repository = "https://github.com/zixuantemp/flarevm-mcp"
 Issues = "https://github.com/zixuantemp/flarevm-mcp/issues"
 
 [tool.setuptools]
+packages = ["flarevm_mcp", "flarevm_mcp.tools"]
 py-modules = ["server"]
 
 [tool.ruff]
@@ -46,3 +50,6 @@ select = ["E", "F", "B"]
 # cannot be wrapped without breaking the script. Real bugs (F-rules) still flag.
 ignore = ["E501"]
 
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

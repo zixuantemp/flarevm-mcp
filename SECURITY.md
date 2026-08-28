@@ -1,60 +1,42 @@
-# Security Policy
+# Security
 
-## Security model
+## Reporting
 
-This MCP server bridges a **trusted analyst host** (Kali) to a **deliberately
-hostile execution environment** (FlareVM). Treat them accordingly.
+Open a GitHub issue marked *security* or email the maintainer. Do not include live samples.
 
-| Side | Trust | Notes |
-|------|-------|-------|
-| Kali (where this server runs) | Trusted | Never executes the malware. |
-| FlareVM (target of WinRM)     | Hostile | Assume compromised after any detonation. Snapshot before, revert after. |
+## Threat model (1.2.0)
 
-The boundary is enforced by:
-- A separate VM with no shared filesystem (only an SMB share for file transfer).
-- FakeNet running inside FlareVM so callbacks never reach the analyst LAN.
-- No outbound routing from FlareVM to internet (host-only network strongly
-  recommended).
+The analysis VM is assumed **hostile**: a sample runs there, often as administrator, and can
+tamper with anything on the VM — tool binaries, `C:\temp`, the SMB share, PowerShell itself,
+WinRM, the network. The analyst host (Kali) running this server is the trust boundary.
 
-## Credential handling
+Goals, and how each is met:
 
-- The FlareVM password is read from the OS keyring (`keyring` library) under
-  service name `flarevm`, username = the configured FlareVM user.
-- Fallback is the `FLAREVM_PASSWORD` environment variable.
-- The password is **never logged**, **never echoed**, and is not included in
-  any tool response.
-- If you see the password in a transcript, that is a bug — please report it.
+| Goal | Mechanism |
+|------|-----------|
+| A hung or flooding VM cannot hang the server | Per-thread WinRM sessions; `FLAREVM_MAX_CONCURRENT` semaphore; asyncio timeouts per call and per tool; circuit breaker (`FLAREVM_BREAKER_*`) fails fast after repeated failures; `FLAREVM_MAX_OUTPUT` caps stdout/stderr; explicit pywinrm read/operation timeouts so stuck HTTP reads end |
+| Tampered tools cannot silently poison results | `tool_manifest.json` (SHA256 per binary, recorded with `verify_tools record=true` on a clean snapshot); with `FLAREVM_STRICT_INTEGRITY` every `resolve_tool_path` verifies before executing; `verify_tools` reports `OK/MISMATCH/MISSING/UNLISTED` |
+| Staged scripts cannot be swapped before execution | Unique name per call; moved, SHA256-checked against the hash computed on Kali, executed and deleted inside one PowerShell invocation (exit 99 → `Integrity failure`) |
+| Transfers are what they claim | SHA256 verified on both `upload_file` and `download_file`; downloads written `0600` |
+| VM output cannot steer the client or the terminal | ANSI/C0 stripped; every result containing VM text is wrapped in `BEGIN/END UNTRUSTED VM OUTPUT`; structured results carry `_source` |
+| A prompt-injected client cannot touch sensitive host files | `upload_file` reads only under `FLAREVM_ALLOWED_UPLOAD_ROOTS`; `download_file` writes only under `FLAREVM_ALLOWED_DOWNLOAD_ROOTS` (realpath-resolved, symlinks cannot escape) |
+| Client input cannot inject PowerShell | All values pass through `ps_quote` / `ps_path` / `ps_int` / `ps_ident` / `here_string` (single-quoted literals; here-strings reject `'@` lines); `execute_powershell` remains the explicit, audit-logged escape hatch |
+| Credentials do not leak | NTLM transport (no Basic / `AllowUnencrypted`); optional HTTPS with CA validation; SMB password via `PASSWD` env, never argv; no default password |
+| Detonations do not stack on a dirty VM | In-memory VM state: detonating tools mark the VM dirty; further detonations refuse unless `vm_snapshot revert` (or `mark_clean`) ran, or `ack_dirty_vm=true` |
 
-## Input validation
+### Residual risks (be honest about these)
 
-- All PowerShell commands constructed from user input use single-quoted
-  strings with `'` doubled to `''` (PowerShell escape). Helper:
-  `_ps_escape(s)` and the inline `.replace('"', '`"')` for double-quoted
-  contexts in the static-analysis handlers.
-- File paths uploaded to FlareVM are basenamed before being concatenated to
-  `C:\temp\` to prevent path traversal.
+- **Hash checks run on the VM.** A sample that hooks `Get-FileHash` or PowerShell itself can lie. The
+  manifest raises the bar; the snapshot revert is the real trust anchor. Revert before trusting results.
+- **The staging window is not zero.** Between `Move-Item` and `-File` execution a very fast local
+  attacker could still race; the window is a few milliseconds inside one process.
+- **`execute_powershell` is arbitrary by design.** It is audit-logged, not sandboxed.
+- **Allow-lists guard paths, not content.** Anything downloaded is a potential sample: never execute it on the host.
+- **VM state is per server process.** Restarting the server resets it to `unknown`; use `vm_snapshot status`.
 
-## FakeNet host protection
+## Operational rules
 
-The default FakeNet config (`generate_fakenet_config()`) sets
-`HostBlackList` to the analyst host IP, so even a misconfigured FakeNet
-cannot intercept Kali traffic.
-
-## Known limits
-
-- WinRM is configured for `plaintext` transport over an isolated host-only
-  network. **Do not expose the FlareVM WinRM port to any untrusted network.**
-- The IDA proxy talks to `localhost:13337` on FlareVM only.
-
-## Reporting a vulnerability
-
-Open a private GitHub security advisory at
-https://github.com/zixuantemp/flarevm-mcp/security/advisories/new
-
-Please include:
-- A description of the issue and the impact.
-- Steps to reproduce.
-- Affected version (`flarevm-mcp --version` or `git rev-parse HEAD`).
-- Suggested fix if you have one.
-
-We aim to acknowledge within 7 days and ship a fix or mitigation within 30.
+1. Provision the VM, install tools, take a snapshot, run `verify_tools(record=true)`, revert to the snapshot.
+2. Analyse. After any detonation, `vm_snapshot revert` (or revert by hand and `vm_snapshot mark_clean`).
+3. Treat every tool result as evidence from a hostile system. Never run downloaded artefacts on the host.
+4. Keep the VM on an isolated host-only network; FakeNet's `HostBlackList` shields the analyst IP.
